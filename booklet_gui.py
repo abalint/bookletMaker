@@ -91,14 +91,19 @@ class ThumbnailCache:
 class ThumbnailGrid(ttk.Frame):
     """Scrollable grid of page thumbnails with selection support."""
 
-    def __init__(self, parent, on_selection_change=None):
+    def __init__(self, parent, on_selection_change=None, on_spread_change=None):
         super().__init__(parent)
         self.on_selection_change = on_selection_change
+        self.on_spread_change = on_spread_change
         self.cache: Optional[ThumbnailCache] = None
         self.photo_images = {}  # Keep references to prevent GC
         self.selected_pages = []  # Ordered list of selected page numbers
         self.thumb_labels = {}  # page_num -> label widget
         self.columns = 6
+
+        # Spread tracking
+        self.spread_pairs = []  # List of (page1, page2) tuples for double-page spreads
+        self.pending_spread_page = None  # First page of incomplete spread marking
 
         # Create scrollable canvas
         self.canvas = tk.Canvas(self, bg='#f0f0f0')
@@ -193,6 +198,12 @@ class ThumbnailGrid(ttk.Frame):
 
     def _on_click(self, page_num: int, event):
         """Handle single click - add page to selection."""
+        # Check for modifier keys (fallback for Windows where bindings may not work)
+        if event.state & 0x4:  # Ctrl key
+            return self._on_ctrl_click(page_num, event)
+        if event.state & 0x1:  # Shift key
+            return self._on_shift_click(page_num, event)
+
         if page_num in self.selected_pages:
             # If already selected, add another instance (for repeats)
             self.selected_pages.append(page_num)
@@ -219,18 +230,41 @@ class ThumbnailGrid(ttk.Frame):
             self.on_selection_change(self.selected_pages)
 
     def _on_ctrl_click(self, page_num: int, event):
-        """Handle ctrl+click - toggle page in selection."""
-        if page_num in self.selected_pages:
-            # Remove last occurrence
-            for i in range(len(self.selected_pages) - 1, -1, -1):
-                if self.selected_pages[i] == page_num:
-                    self.selected_pages.pop(i)
-                    break
+        """Handle ctrl+click - mark double-page spreads."""
+        if self.pending_spread_page is None:
+            # First page of spread pair
+            self.pending_spread_page = page_num
+            self._update_selection_display()
         else:
-            self.selected_pages.append(page_num)
-        self._update_selection_display()
-        if self.on_selection_change:
-            self.on_selection_change(self.selected_pages)
+            # Second page of spread pair
+            first_page = self.pending_spread_page
+            second_page = page_num
+
+            # Check if pages are adjacent
+            if abs(first_page - second_page) == 1:
+                # Order the pair (lower page first)
+                pair = (min(first_page, second_page), max(first_page, second_page))
+
+                # Check if already marked as spread
+                if pair in self.spread_pairs:
+                    # Remove the spread pair
+                    self.spread_pairs.remove(pair)
+                else:
+                    # Add as spread pair
+                    self.spread_pairs.append(pair)
+
+                self.pending_spread_page = None
+                self._update_selection_display()
+                # Notify about spread change
+                if self.on_spread_change:
+                    self.on_spread_change(self.spread_pairs)
+            else:
+                # Not adjacent - show error and reset
+                messagebox.showwarning("Invalid Spread",
+                    f"Pages {first_page} and {second_page} are not adjacent.\n"
+                    "Double-page spreads must be consecutive pages.")
+                self.pending_spread_page = None
+                self._update_selection_display()
 
     def _update_selection_display(self):
         """Update visual indication of selected pages."""
@@ -239,11 +273,25 @@ class ThumbnailGrid(ttk.Frame):
         for p in self.selected_pages:
             counts[p] = counts.get(p, 0) + 1
 
+        # Collect spread pages for yellow highlighting
+        spread_pages = set()
+        for p1, p2 in self.spread_pairs:
+            spread_pages.add(p1)
+            spread_pages.add(p2)
+
         for page_num, label in self.thumb_labels.items():
-            if page_num in counts:
-                label.configure(bg='#4CAF50', relief="solid")  # Green border
+            if page_num == self.pending_spread_page:
+                # Pending spread page - orange to indicate waiting for second page
+                label.configure(highlightbackground='#FF9800', highlightthickness=3)
+            elif page_num in spread_pages:
+                # Spread pair - yellow
+                label.configure(highlightbackground='#FFEB3B', highlightthickness=3)
+            elif page_num in counts:
+                # Selected - green
+                label.configure(highlightbackground='#4CAF50', highlightthickness=3)
             else:
-                label.configure(bg='#f0f0f0', relief="flat")
+                # Not selected
+                label.configure(highlightbackground='#f0f0f0', highlightthickness=0)
 
     def set_selection(self, pages: List[int]):
         """Set selection from list of page numbers."""
@@ -256,6 +304,44 @@ class ThumbnailGrid(ttk.Frame):
         self._update_selection_display()
         if self.on_selection_change:
             self.on_selection_change(self.selected_pages)
+
+    def get_spread_pairs(self) -> List[Tuple[int, int]]:
+        """Get the list of marked spread pairs."""
+        return self.spread_pairs.copy()
+
+    def check_spread_alignment(self, pages: List) -> List[Tuple[Tuple[int, int], int, int]]:
+        """
+        Check if marked spreads will print correctly aligned.
+
+        Args:
+            pages: List of page numbers/blanks in selection order
+
+        Returns:
+            List of (spread_pair, pos1, pos2) for misaligned spreads
+        """
+        misaligned = []
+
+        for pair in self.spread_pairs:
+            p1, p2 = pair
+
+            # Find positions of both pages in the selection
+            try:
+                pos1 = pages.index(p1)
+                pos2 = pages.index(p2)
+            except ValueError:
+                # One or both pages not in selection
+                continue
+
+            # For a spread to print correctly, pages must be at positions
+            # where first is at odd index and second is at odd+1
+            # (0-indexed: positions 1,2 or 3,4 or 5,6 etc.)
+            is_aligned = (pos1 % 2 == 1 and pos2 == pos1 + 1) or \
+                         (pos2 % 2 == 1 and pos1 == pos2 + 1)
+
+            if not is_aligned:
+                misaligned.append((pair, pos1, pos2))
+
+        return misaligned
 
 
 class SpreadPreview(ttk.Frame):
@@ -477,6 +563,10 @@ class SelectionBuilder(ttk.Frame):
         self.info_label = ttk.Label(self, text="Pages: 0 | Needed: 0 | Missing: 0")
         self.info_label.pack(anchor='w')
 
+        # Spread warning display
+        self.spread_warning = ttk.Label(self, text="", foreground='#D32F2F')  # Red text
+        self.spread_warning.pack(anchor='w')
+
         # Buttons
         btn_frame = ttk.Frame(self)
         btn_frame.pack(fill='x', pady=5)
@@ -550,6 +640,20 @@ class SelectionBuilder(ttk.Frame):
             text=f"Pages: {count} | Needed for booklet: {needed} | Missing: {missing}"
         )
 
+    def set_spread_warning(self, misaligned: List[Tuple]):
+        """Update spread alignment warning.
+
+        Args:
+            misaligned: List of (spread_pair, pos1, pos2) for misaligned spreads
+        """
+        if not misaligned:
+            self.spread_warning.configure(text="")
+        else:
+            warnings = []
+            for pair, pos1, pos2 in misaligned:
+                warnings.append(f"⚠ Spread {pair[0]}-{pair[1]} misaligned (positions {pos1+1},{pos2+1})")
+            self.spread_warning.configure(text=" | ".join(warnings))
+
     def _add_blank(self):
         """Add a blank marker to selection."""
         current = self.get_selection_string()
@@ -620,7 +724,9 @@ class BookletMakerGUI(tk.Tk):
         left_frame = ttk.LabelFrame(paned, text="PDF Pages")
         paned.add(left_frame, weight=2)
 
-        self.thumbnail_grid = ThumbnailGrid(left_frame, on_selection_change=self._on_selection_change)
+        self.thumbnail_grid = ThumbnailGrid(left_frame,
+                                           on_selection_change=self._on_selection_change,
+                                           on_spread_change=self._on_spread_change)
         self.thumbnail_grid.pack(fill='both', expand=True)
 
         # Right panel - Preview and options
@@ -742,12 +848,24 @@ class BookletMakerGUI(tk.Tk):
         self.selection_builder.set_from_pages(pages)
         self._save_current_book()
         self._update_preview()
+        self._check_spread_alignment()
 
     def _on_selection_text_change(self, pages: List):
         """Handle selection change from text entry."""
         self.thumbnail_grid.set_selection([p for p in pages if p != "blank"])
         self._save_current_book()
         self._update_preview()
+        self._check_spread_alignment()
+
+    def _check_spread_alignment(self):
+        """Check and display spread alignment warnings."""
+        pages = self.selection_builder.get_pages()
+        misaligned = self.thumbnail_grid.check_spread_alignment(pages)
+        self.selection_builder.set_spread_warning(misaligned)
+
+    def _on_spread_change(self, spread_pairs: List):
+        """Handle spread pairs change from thumbnail grid."""
+        self._check_spread_alignment()
 
     def _on_book_select(self, index: int, book: dict):
         """Handle book selection from list."""
