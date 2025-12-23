@@ -399,7 +399,8 @@ def generate_booklet(
     num_signatures: int,
     duplex_mode: str,
     output_name: str = None,
-    paper_size: str = DEFAULT_PAPER_SIZE
+    paper_size: str = DEFAULT_PAPER_SIZE,
+    output_dir: str = None
 ) -> List[str]:
     """
     Generate booklet PDF(s) from input comic PDF.
@@ -412,6 +413,7 @@ def generate_booklet(
         duplex_mode: "auto" or "manual"
         output_name: Custom output folder name (default: input filename)
         paper_size: Paper size key from PAPER_SIZES dict
+        output_dir: Custom output directory path (default: input_path.parent/prints/output_name)
 
     Returns:
         List of output file paths
@@ -431,7 +433,10 @@ def generate_booklet(
     if output_name is None:
         output_name = input_path.stem
 
-    output_dir = input_path.parent / "prints" / output_name
+    if output_dir:
+        output_dir = Path(output_dir) / output_name
+    else:
+        output_dir = input_path.parent / "prints" / output_name
     output_dir.mkdir(parents=True, exist_ok=True)
 
     all_output_files = []

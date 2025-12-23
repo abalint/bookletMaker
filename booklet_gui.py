@@ -33,6 +33,45 @@ except ImportError:
     print("Error: booklet_maker.py must be in the same directory")
     sys.exit(1)
 
+import json
+
+# Configuration file handling
+DEFAULT_CONFIG = {
+    "reading_order": "western",
+    "signatures": 1,
+    "duplex_mode": "auto",
+    "paper_size": DEFAULT_PAPER_SIZE,
+    "output_folder": ""
+}
+
+def get_config_path() -> Path:
+    """Get path to config file in same directory as script."""
+    return Path(__file__).parent / "config.json"
+
+def load_config() -> dict:
+    """Load config from file, return defaults if not found."""
+    config_path = get_config_path()
+    if config_path.exists():
+        try:
+            with open(config_path, 'r') as f:
+                saved_config = json.load(f)
+                # Merge with defaults to handle missing keys
+                config = DEFAULT_CONFIG.copy()
+                config.update(saved_config)
+                return config
+        except (json.JSONDecodeError, IOError):
+            pass
+    return DEFAULT_CONFIG.copy()
+
+def save_config(config: dict) -> None:
+    """Save config dict to file."""
+    config_path = get_config_path()
+    try:
+        with open(config_path, 'w') as f:
+            json.dump(config, f, indent=2)
+    except IOError:
+        pass  # Silently fail if can't write config
+
 
 class ThumbnailCache:
     """Manages PDF page thumbnails with lazy loading."""
@@ -682,12 +721,18 @@ class BookletMakerGUI(tk.Tk):
         self.current_book_index = 0
         self._updating_from_list = False  # Prevent recursive updates
 
+        # Load saved configuration
+        self.user_config = load_config()
+
         self._create_menu()
         self._create_ui()
 
         # Initialize with one empty book
         self.book_list.set_books([{'selection': ''}])
         self.book_list.set_current_index(0)
+
+        # Save config on window close
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _create_menu(self):
         """Create menu bar."""
@@ -774,21 +819,21 @@ class BookletMakerGUI(tk.Tk):
         # Reading order
         ttk.Label(opts_inner, text="Reading Order:").grid(row=0, column=0, padx=5)
         self.reading_order = ttk.Combobox(opts_inner, values=['western', 'manga'], width=10, state='readonly')
-        self.reading_order.set('western')
+        self.reading_order.set(self.user_config['reading_order'])
         self.reading_order.grid(row=0, column=1, padx=5)
         self.reading_order.bind('<<ComboboxSelected>>', lambda e: self._update_preview())
 
         # Signatures
         ttk.Label(opts_inner, text="Signatures:").grid(row=0, column=2, padx=5)
         self.signatures = ttk.Spinbox(opts_inner, from_=1, to=10, width=5)
-        self.signatures.set(1)
+        self.signatures.set(self.user_config['signatures'])
         self.signatures.grid(row=0, column=3, padx=5)
         self.signatures.bind('<KeyRelease>', lambda e: self._update_preview())
 
         # Duplex
         ttk.Label(opts_inner, text="Duplex:").grid(row=0, column=4, padx=5)
         self.duplex_mode = ttk.Combobox(opts_inner, values=['auto', 'manual'], width=10, state='readonly')
-        self.duplex_mode.set('auto')
+        self.duplex_mode.set(self.user_config['duplex_mode'])
         self.duplex_mode.grid(row=0, column=5, padx=5)
 
         # Paper size
@@ -803,7 +848,7 @@ class BookletMakerGUI(tk.Tk):
         self.paper_size_keys = {v: k for k, v in self.paper_size_labels.items()}
         paper_display_values = [self.paper_size_labels[k] for k in PAPER_SIZES.keys()]
         self.paper_size = ttk.Combobox(opts_inner, values=paper_display_values, width=16, state='readonly')
-        self.paper_size.set(self.paper_size_labels[DEFAULT_PAPER_SIZE])
+        self.paper_size.set(self.paper_size_labels.get(self.user_config['paper_size'], self.paper_size_labels[DEFAULT_PAPER_SIZE]))
         self.paper_size.grid(row=0, column=7, padx=5)
 
         # Output name
@@ -811,11 +856,18 @@ class BookletMakerGUI(tk.Tk):
         self.output_name = ttk.Entry(opts_inner, width=25)
         self.output_name.grid(row=0, column=9, padx=5)
 
-        # Generate button
+        # Generate button and output folder
         btn_frame = ttk.Frame(bottom_frame)
         btn_frame.pack(fill='x', pady=10)
 
         ttk.Button(btn_frame, text="Generate All Books", command=self._generate).pack(side='right', padx=5)
+
+        # Output folder selection
+        self.output_folder_var = tk.StringVar(value=self.user_config['output_folder'])
+        ttk.Button(btn_frame, text="Browse...", command=self._browse_output_folder).pack(side='right', padx=5)
+        self.output_folder_entry = ttk.Entry(btn_frame, textvariable=self.output_folder_var, width=40)
+        self.output_folder_entry.pack(side='right', padx=5)
+        ttk.Label(btn_frame, text="Output Folder:").pack(side='right', padx=(0, 5))
 
     def _open_pdf(self):
         """Open a PDF file."""
@@ -842,6 +894,37 @@ class BookletMakerGUI(tk.Tk):
             self.selection_builder.set_total_pages(
                 pdfium.PdfDocument(path).__len__()
             )
+
+            # Set default output folder only if not already set from config
+            if not self.output_folder_var.get():
+                self.output_folder_var.set(str(Path(path).parent / "prints"))
+
+    def _browse_output_folder(self):
+        """Open folder selection dialog for output directory."""
+        initial_dir = self.output_folder_var.get() or (Path(self.pdf_path).parent if self.pdf_path else None)
+        folder = filedialog.askdirectory(
+            title="Select Output Folder",
+            initialdir=initial_dir
+        )
+        if folder:
+            self.output_folder_var.set(folder)
+
+    def _save_config(self):
+        """Save current settings to config file."""
+        paper_size_key = self.paper_size_keys.get(self.paper_size.get(), DEFAULT_PAPER_SIZE)
+        config = {
+            "reading_order": self.reading_order.get(),
+            "signatures": int(self.signatures.get()),
+            "duplex_mode": self.duplex_mode.get(),
+            "paper_size": paper_size_key,
+            "output_folder": self.output_folder_var.get()
+        }
+        save_config(config)
+
+    def _on_close(self):
+        """Handle window close - save config and exit."""
+        self._save_config()
+        self.destroy()
 
     def _on_selection_change(self, pages: List[int]):
         """Handle selection change from thumbnail grid."""
@@ -944,12 +1027,16 @@ class BookletMakerGUI(tk.Tk):
                 num_signatures=int(self.signatures.get()),
                 duplex_mode=self.duplex_mode.get(),
                 output_name=output_name,
-                paper_size=paper_size_key
+                paper_size=paper_size_key,
+                output_dir=self.output_folder_var.get() or None
             )
 
             messagebox.showinfo("Success",
                                f"Generated {len(output_files)} files:\n" +
                                "\n".join(Path(f).name for f in output_files))
+
+            # Save settings after successful generation
+            self._save_config()
 
         except Exception as e:
             messagebox.showerror("Error", f"Generation failed:\n{e}")
