@@ -28,7 +28,11 @@ except ImportError:
 
 # Import booklet_maker for generation
 try:
-    from booklet_maker import generate_booklet, parse_page_selection, calculate_booklet_order, PAPER_SIZES, DEFAULT_PAPER_SIZE
+    from booklet_maker import (
+        generate_booklet, parse_page_selection, calculate_booklet_order,
+        PAPER_SIZES, DEFAULT_PAPER_SIZE, cbz_to_pdf,
+        split_double_pages, PYMUPDF_AVAILABLE
+    )
 except ImportError:
     print("Error: booklet_maker.py must be in the same directory")
     sys.exit(1)
@@ -717,7 +721,8 @@ class BookletMakerGUI(tk.Tk):
         self.title("Booklet Maker GUI")
         self.geometry("1200x800")
 
-        self.pdf_path = None
+        self.pdf_path = None  # Original file path (PDF or CBZ)
+        self.temp_pdf_path = None  # Temp PDF path if CBZ was converted
         self.current_book_index = 0
         self._updating_from_list = False  # Prevent recursive updates
 
@@ -757,6 +762,10 @@ class BookletMakerGUI(tk.Tk):
         self.file_label.pack(side='left')
 
         ttk.Button(top_frame, text="Open PDF", command=self._open_pdf).pack(side='left', padx=10)
+
+        # Split double pages button (only if PyMuPDF available)
+        if PYMUPDF_AVAILABLE:
+            ttk.Button(top_frame, text="Split Double Pages", command=self._split_double_pages).pack(side='left', padx=5)
 
         self.progress = ttk.Progressbar(top_frame, length=200, mode='determinate')
         self.progress.pack(side='right')
@@ -869,19 +878,45 @@ class BookletMakerGUI(tk.Tk):
         self.output_folder_entry.pack(side='right', padx=5)
         ttk.Label(btn_frame, text="Output Folder:").pack(side='right', padx=(0, 5))
 
+    def _cleanup_temp_pdf(self):
+        """Clean up temporary PDF file if it exists."""
+        if self.temp_pdf_path and os.path.exists(self.temp_pdf_path):
+            try:
+                os.unlink(self.temp_pdf_path)
+            except OSError:
+                pass  # Ignore cleanup errors
+            self.temp_pdf_path = None
+
     def _open_pdf(self):
-        """Open a PDF file."""
+        """Open a PDF or CBZ file."""
         path = filedialog.askopenfilename(
-            title="Select PDF",
-            filetypes=[("PDF files", "*.pdf"), ("All files", "*.*")]
+            title="Select PDF or CBZ",
+            filetypes=[("Comic files", "*.pdf *.cbz"), ("PDF files", "*.pdf"), ("CBZ files", "*.cbz"), ("All files", "*.*")]
         )
         if path:
+            # Clean up any previous temp file
+            self._cleanup_temp_pdf()
+
             self.pdf_path = path
             self.file_label.configure(text=f"{Path(path).name}")
 
             # Set default output name
             self.output_name.delete(0, tk.END)
             self.output_name.insert(0, Path(path).stem + "_book1")
+
+            # Convert CBZ to temp PDF for thumbnail display
+            if Path(path).suffix.lower() == '.cbz':
+                self.file_label.configure(text=f"{Path(path).name} (converting...)")
+                self.update_idletasks()
+                try:
+                    self.temp_pdf_path = cbz_to_pdf(path)
+                    pdf_for_display = self.temp_pdf_path
+                    self.file_label.configure(text=f"{Path(path).name}")
+                except Exception as e:
+                    messagebox.showerror("Error", f"Failed to convert CBZ:\n{e}")
+                    return
+            else:
+                pdf_for_display = path
 
             # Load thumbnails
             self.progress['value'] = 0
@@ -890,14 +925,72 @@ class BookletMakerGUI(tk.Tk):
                 self.progress['value'] = (current / total) * 100
                 self.update_idletasks()
 
-            self.thumbnail_grid.load_pdf(path, on_progress)
+            self.thumbnail_grid.load_pdf(pdf_for_display, on_progress)
             self.selection_builder.set_total_pages(
-                pdfium.PdfDocument(path).__len__()
+                pdfium.PdfDocument(pdf_for_display).__len__()
             )
 
             # Set default output folder only if not already set from config
             if not self.output_folder_var.get():
                 self.output_folder_var.set(str(Path(path).parent / "prints"))
+
+    def _split_double_pages(self):
+        """Split double-page spreads in the currently loaded file."""
+        if not self.pdf_path:
+            messagebox.showerror("Error", "No file loaded")
+            return
+
+        # Get the PDF to process (use temp PDF if we converted from CBZ)
+        pdf_to_split = self.temp_pdf_path if self.temp_pdf_path else self.pdf_path
+
+        self.file_label.configure(text=f"{Path(self.pdf_path).name} (splitting...)")
+        self.update_idletasks()
+
+        try:
+            # Split the double pages
+            result = split_double_pages(pdf_to_split)
+
+            if result['splits_made'] == 0:
+                self.file_label.configure(text=f"{Path(self.pdf_path).name}")
+                messagebox.showinfo("No Changes", "No double-page spreads detected.")
+                return
+
+            # Clean up old temp file if it's different from the new one
+            old_temp = self.temp_pdf_path
+            self.temp_pdf_path = result['output_path']
+
+            if old_temp and old_temp != result['output_path'] and os.path.exists(old_temp):
+                try:
+                    os.unlink(old_temp)
+                except OSError:
+                    pass
+
+            # Reload thumbnails from the split PDF
+            self.progress['value'] = 0
+
+            def on_progress(current, total):
+                self.progress['value'] = (current / total) * 100
+                self.update_idletasks()
+
+            self.thumbnail_grid.load_pdf(self.temp_pdf_path, on_progress)
+            self.selection_builder.set_total_pages(
+                pdfium.PdfDocument(self.temp_pdf_path).__len__()
+            )
+
+            # Clear any existing selection since page numbers changed
+            self.thumbnail_grid.clear_selection()
+            self.selection_builder.set_selection_string("")
+
+            self.file_label.configure(text=f"{Path(self.pdf_path).name}")
+            messagebox.showinfo(
+                "Split Complete",
+                f"Split {result['splits_made']} double-page spread(s).\n"
+                f"Pages: {result['original_pages']} → {result['output_pages']}"
+            )
+
+        except Exception as e:
+            self.file_label.configure(text=f"{Path(self.pdf_path).name}")
+            messagebox.showerror("Error", f"Failed to split pages:\n{e}")
 
     def _browse_output_folder(self):
         """Open folder selection dialog for output directory."""
@@ -922,8 +1015,9 @@ class BookletMakerGUI(tk.Tk):
         save_config(config)
 
     def _on_close(self):
-        """Handle window close - save config and exit."""
+        """Handle window close - save config, cleanup, and exit."""
         self._save_config()
+        self._cleanup_temp_pdf()
         self.destroy()
 
     def _on_selection_change(self, pages: List[int]):

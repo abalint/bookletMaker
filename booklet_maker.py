@@ -2,7 +2,7 @@
 """
 Comic Book Booklet Maker
 
-Converts comic book PDFs into print-ready booklet format for 11x17" paper.
+Converts comic book PDFs and CBZ files into print-ready booklet format for 11x17" paper.
 Supports page selection, blank page insertion, multiple signatures,
 Western/Manga reading order, and duplex/manual printing modes.
 """
@@ -11,6 +11,8 @@ import argparse
 import io
 import os
 import sys
+import tempfile
+import zipfile
 from pathlib import Path
 from typing import List, Tuple, Union
 
@@ -26,6 +28,160 @@ try:
 except ImportError:
     print("Error: reportlab is required. Install with: pip install reportlab")
     sys.exit(1)
+
+try:
+    from PIL import Image
+except ImportError:
+    print("Error: Pillow is required. Install with: pip install Pillow")
+    sys.exit(1)
+
+# PyMuPDF is optional - only needed for split_double_pages
+try:
+    import fitz  # PyMuPDF
+    PYMUPDF_AVAILABLE = True
+except ImportError:
+    PYMUPDF_AVAILABLE = False
+
+
+# Supported image extensions for CBZ extraction
+IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp'}
+
+
+def cbz_to_pdf(cbz_path: str) -> str:
+    """
+    Convert a CBZ file to a temporary PDF.
+
+    CBZ files are ZIP archives containing comic book images.
+    This function extracts the images and creates a PDF with one page per image.
+
+    Args:
+        cbz_path: Path to the CBZ file
+
+    Returns:
+        Path to the temporary PDF file
+    """
+    cbz_path = Path(cbz_path)
+
+    # Create temporary PDF file
+    temp_pdf = tempfile.NamedTemporaryFile(suffix='.pdf', delete=False)
+    temp_pdf_path = temp_pdf.name
+    temp_pdf.close()
+
+    with zipfile.ZipFile(cbz_path, 'r') as zf:
+        # Get list of image files, sorted by name
+        image_files = sorted([
+            name for name in zf.namelist()
+            if Path(name).suffix.lower() in IMAGE_EXTENSIONS
+            and not Path(name).name.startswith('.')  # Skip hidden files
+        ])
+
+        if not image_files:
+            raise ValueError(f"No images found in CBZ file: {cbz_path}")
+
+        # Convert images to PDF
+        pdf_images = []
+        for img_name in image_files:
+            with zf.open(img_name) as img_file:
+                img = Image.open(img_file)
+                # Convert to RGB if necessary (for PNG with transparency, etc.)
+                if img.mode in ('RGBA', 'P', 'LA'):
+                    # Create white background for transparent images
+                    background = Image.new('RGB', img.size, (255, 255, 255))
+                    if img.mode == 'P':
+                        img = img.convert('RGBA')
+                    background.paste(img, mask=img.split()[-1] if img.mode in ('RGBA', 'LA') else None)
+                    img = background
+                elif img.mode != 'RGB':
+                    img = img.convert('RGB')
+                pdf_images.append(img.copy())
+
+        # Save all images as a PDF
+        if pdf_images:
+            pdf_images[0].save(
+                temp_pdf_path,
+                'PDF',
+                save_all=True,
+                append_images=pdf_images[1:] if len(pdf_images) > 1 else []
+            )
+
+    print(f"Converted CBZ to temporary PDF: {len(pdf_images)} pages")
+    return temp_pdf_path
+
+
+def split_double_pages(input_path: str, output_path: str = None) -> dict:
+    """
+    Split double-page spreads in a PDF into separate pages.
+
+    Detects oversized pages (width > 1.5× the most common page width) and splits them
+    into left and right halves.
+
+    Args:
+        input_path: Path to input PDF file
+        output_path: Path for output PDF (if None, creates a temp file)
+
+    Returns:
+        dict with: original_pages, output_pages, splits_made, output_path
+
+    Raises:
+        RuntimeError: If PyMuPDF is not installed
+    """
+    if not PYMUPDF_AVAILABLE:
+        raise RuntimeError("PyMuPDF is required for split_double_pages. Install with: pip install pymupdf")
+
+    from collections import Counter
+
+    # Create output path if not provided
+    if output_path is None:
+        temp_file = tempfile.NamedTemporaryFile(suffix='.pdf', delete=False)
+        output_path = temp_file.name
+        temp_file.close()
+
+    doc = fitz.open(input_path)
+    new_doc = fitz.open()  # Create empty document
+
+    splits_made = 0
+    original_pages = len(doc)
+
+    # Find the most common page width (standard width)
+    widths = [round(page.rect.width) for page in doc]
+    width_counts = Counter(widths)
+    standard_width = width_counts.most_common(1)[0][0]
+
+    for page_num in range(len(doc)):
+        page = doc[page_num]
+        rect = page.rect
+        width = rect.width
+        height = rect.height
+
+        # Detect double-page spread: width > 1.5× standard width
+        if width > standard_width * 1.5:
+            # This is a double-page spread - split it
+            splits_made += 1
+
+            # Left half
+            left_rect = fitz.Rect(0, 0, width / 2, height)
+            left_page = new_doc.new_page(width=width / 2, height=height)
+            left_page.show_pdf_page(left_page.rect, doc, page_num, clip=left_rect)
+
+            # Right half
+            right_rect = fitz.Rect(width / 2, 0, width, height)
+            right_page = new_doc.new_page(width=width / 2, height=height)
+            right_page.show_pdf_page(right_page.rect, doc, page_num, clip=right_rect)
+        else:
+            # Normal page - copy as-is
+            new_doc.insert_pdf(doc, from_page=page_num, to_page=page_num)
+
+    # Save the new document
+    new_doc.save(output_path, garbage=4, deflate=True)
+    new_doc.close()
+    doc.close()
+
+    return {
+        'original_pages': original_pages,
+        'output_pages': original_pages + splits_made,
+        'splits_made': splits_made,
+        'output_path': output_path
+    }
 
 
 # Paper sizes in points (72 points per inch) - (width, height) in landscape orientation
@@ -419,56 +575,71 @@ def generate_booklet(
         List of output file paths
     """
     input_path = Path(input_path)
-    reader = PdfReader(str(input_path))
-    total_pages = len(reader.pages)
+    temp_pdf_path = None
 
-    print(f"Input PDF: {input_path.name}")
-    print(f"Total pages: {total_pages}")
-
-    # Default to all pages if no selections provided
-    if not page_selections:
-        page_selections = [f"1-{total_pages}"]
-
-    # Create output directory
-    if output_name is None:
-        output_name = input_path.stem
-
-    if output_dir:
-        output_dir = Path(output_dir) / output_name
+    # Check if input is a CBZ file and convert to PDF
+    if input_path.suffix.lower() == '.cbz':
+        print(f"Input CBZ: {input_path.name}")
+        temp_pdf_path = cbz_to_pdf(str(input_path))
+        pdf_path = temp_pdf_path
     else:
-        output_dir = input_path.parent / "prints" / output_name
-    output_dir.mkdir(parents=True, exist_ok=True)
+        pdf_path = str(input_path)
+        print(f"Input PDF: {input_path.name}")
 
-    all_output_files = []
-    num_books = len(page_selections)
+    try:
+        reader = PdfReader(pdf_path)
+        total_pages = len(reader.pages)
+        print(f"Total pages: {total_pages}")
 
-    print(f"\nGenerating {num_books} booklet(s)...\n")
+        # Default to all pages if no selections provided
+        if not page_selections:
+            page_selections = [f"1-{total_pages}"]
 
-    for book_idx, page_selection in enumerate(page_selections):
-        # Add book suffix only if multiple books
-        if num_books > 1:
-            book_suffix = f"_book{book_idx + 1}"
-            print(f"Book {book_idx + 1}: {page_selection}")
+        # Create output directory
+        if output_name is None:
+            output_name = input_path.stem
+
+        if output_dir:
+            output_dir = Path(output_dir) / output_name
         else:
-            book_suffix = ""
-            print(f"Selection: {page_selection}")
+            output_dir = input_path.parent / "prints" / output_name
+        output_dir.mkdir(parents=True, exist_ok=True)
 
-        output_files = generate_single_booklet(
-            reader=reader,
-            page_selection=page_selection,
-            total_pages=total_pages,
-            reading_order=reading_order,
-            num_signatures=num_signatures,
-            duplex_mode=duplex_mode,
-            output_dir=output_dir,
-            output_name=output_name,
-            book_suffix=book_suffix,
-            paper_size=paper_size
-        )
-        all_output_files.extend(output_files)
-        print()
+        all_output_files = []
+        num_books = len(page_selections)
 
-    return all_output_files
+        print(f"\nGenerating {num_books} booklet(s)...\n")
+
+        for book_idx, page_selection in enumerate(page_selections):
+            # Add book suffix only if multiple books
+            if num_books > 1:
+                book_suffix = f"_book{book_idx + 1}"
+                print(f"Book {book_idx + 1}: {page_selection}")
+            else:
+                book_suffix = ""
+                print(f"Selection: {page_selection}")
+
+            output_files = generate_single_booklet(
+                reader=reader,
+                page_selection=page_selection,
+                total_pages=total_pages,
+                reading_order=reading_order,
+                num_signatures=num_signatures,
+                duplex_mode=duplex_mode,
+                output_dir=output_dir,
+                output_name=output_name,
+                book_suffix=book_suffix,
+                paper_size=paper_size
+            )
+            all_output_files.extend(output_files)
+            print()
+
+        return all_output_files
+
+    finally:
+        # Clean up temporary PDF if we converted from CBZ
+        if temp_pdf_path and os.path.exists(temp_pdf_path):
+            os.unlink(temp_pdf_path)
 
 
 def interactive_mode(input_path: str = None) -> dict:
@@ -485,7 +656,7 @@ def interactive_mode(input_path: str = None) -> dict:
 
     # Input file
     if not input_path:
-        input_path = input("Enter path to PDF file: ").strip()
+        input_path = input("Enter path to PDF or CBZ file: ").strip()
         if input_path.startswith('"') and input_path.endswith('"'):
             input_path = input_path[1:-1]
 
@@ -493,10 +664,23 @@ def interactive_mode(input_path: str = None) -> dict:
         print(f"Error: File not found: {input_path}")
         sys.exit(1)
 
-    # Get page count
-    reader = PdfReader(input_path)
-    total_pages = len(reader.pages)
-    print(f"\nPDF has {total_pages} pages.\n")
+    # Get page count (convert CBZ to temp PDF if needed)
+    input_path_obj = Path(input_path)
+    temp_pdf_for_count = None
+    try:
+        if input_path_obj.suffix.lower() == '.cbz':
+            print("Converting CBZ to get page count...")
+            temp_pdf_for_count = cbz_to_pdf(input_path)
+            reader = PdfReader(temp_pdf_for_count)
+        else:
+            reader = PdfReader(input_path)
+        total_pages = len(reader.pages)
+    finally:
+        if temp_pdf_for_count and os.path.exists(temp_pdf_for_count):
+            os.unlink(temp_pdf_for_count)
+
+    file_type = "CBZ" if input_path_obj.suffix.lower() == '.cbz' else "PDF"
+    print(f"\n{file_type} has {total_pages} pages.\n")
 
     # Page selections (multiple books)
     print("Page selection examples:")
@@ -563,11 +747,12 @@ def interactive_mode(input_path: str = None) -> dict:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Convert comic PDFs to print-ready booklet format. Supports multiple paper sizes.",
+        description="Convert comic PDFs and CBZ files to print-ready booklet format. Supports multiple paper sizes.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   %(prog)s comic.pdf
+  %(prog)s comic.cbz                                   # CBZ files supported
   %(prog)s comic.pdf -p "1-20"
   %(prog)s comic.pdf -p "1-24" -p "25-48" -p "49-72"   # Multiple books
   %(prog)s comic.pdf -p "b,1-20,b" --reading-order manga
@@ -576,7 +761,7 @@ Examples:
         """
     )
 
-    parser.add_argument('input', nargs='?', help='Input PDF file')
+    parser.add_argument('input', nargs='?', help='Input PDF or CBZ file')
     parser.add_argument('-p', '--pages', action='append',
                         help='Page selection (can be used multiple times for multiple books)')
     parser.add_argument('--reading-order', choices=['western', 'manga'], default='western',
