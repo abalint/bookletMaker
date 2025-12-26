@@ -134,10 +134,11 @@ class ThumbnailCache:
 class ThumbnailGrid(ttk.Frame):
     """Scrollable grid of page thumbnails with selection support."""
 
-    def __init__(self, parent, on_selection_change=None, on_spread_change=None):
+    def __init__(self, parent, on_selection_change=None, on_spread_change=None, on_hover=None):
         super().__init__(parent)
         self.on_selection_change = on_selection_change
         self.on_spread_change = on_spread_change
+        self.on_hover = on_hover
         self.cache: Optional[ThumbnailCache] = None
         self.photo_images = {}  # Keep references to prevent GC
         self.selected_pages = []  # Ordered list of selected page numbers
@@ -224,6 +225,7 @@ class ThumbnailGrid(ttk.Frame):
         label.bind("<Button-1>", lambda e, p=page_num: self._on_click(p, e))
         label.bind("<Shift-Button-1>", lambda e, p=page_num: self._on_shift_click(p, e))
         label.bind("<Control-Button-1>", lambda e, p=page_num: self._on_ctrl_click(p, e))
+        label.bind("<Enter>", lambda e, p=page_num: self._on_hover(p))
 
         # Page number label
         num_label = ttk.Label(frame, text=str(page_num))
@@ -309,6 +311,11 @@ class ThumbnailGrid(ttk.Frame):
                 self.pending_spread_page = None
                 self._update_selection_display()
 
+    def _on_hover(self, page_num: int):
+        """Handle mouse hover over a thumbnail."""
+        if self.on_hover:
+            self.on_hover(page_num)
+
     def _update_selection_display(self):
         """Update visual indication of selected pages."""
         # Count occurrences of each page
@@ -387,74 +394,95 @@ class ThumbnailGrid(ttk.Frame):
         return misaligned
 
 
-class SpreadPreview(ttk.Frame):
-    """Shows booklet spread layout preview."""
+class PagePreview(ttk.Frame):
+    """Shows a larger preview of the currently hovered page."""
+
+    PREVIEW_SIZE = (350, 500)  # Width, Height for preview
 
     def __init__(self, parent):
         super().__init__(parent)
 
-        # Header
-        self.header = ttk.Label(self, text="Booklet Preview", font=('TkDefaultFont', 10, 'bold'))
-        self.header.pack(pady=(0, 5))
+        self.cache: Optional[ThumbnailCache] = None
+        self.current_page = None
+        self.photo_image = None  # Keep reference to prevent GC
 
-        # Scrollable list of spreads
-        self.canvas = tk.Canvas(self, width=280, bg='white')
-        self.scrollbar = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
-        self.content = ttk.Frame(self.canvas)
+        # Header label showing page number
+        self.header = ttk.Label(self, text="Hover over a page", font=('TkDefaultFont', 10, 'bold'))
+        self.header.pack(pady=(0, 10))
 
-        self.content.bind("<Configure>", lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
-        self.canvas.create_window((0, 0), window=self.content, anchor="nw")
-        self.canvas.configure(yscrollcommand=self.scrollbar.set)
+        # Canvas to display the page image
+        self.canvas = tk.Canvas(self, width=self.PREVIEW_SIZE[0], height=self.PREVIEW_SIZE[1], bg='#f0f0f0')
+        self.canvas.pack(fill='both', expand=True)
 
-        self.canvas.pack(side="left", fill="both", expand=True)
-        self.scrollbar.pack(side="right", fill="y")
+        # Create placeholder text
+        self.placeholder_text = self.canvas.create_text(
+            self.PREVIEW_SIZE[0] // 2, self.PREVIEW_SIZE[1] // 2,
+            text="Hover over a page\nto preview",
+            font=('TkDefaultFont', 12),
+            fill='#888888',
+            justify='center'
+        )
+        self.image_id = None
 
-        self.spread_labels = []
+    def set_cache(self, cache: ThumbnailCache):
+        """Set the thumbnail cache to use for rendering pages."""
+        self.cache = cache
+        self.clear()
 
-    def update_preview(self, pages: List, reading_order: str = 'western', num_signatures: int = 1):
-        """Update preview with current page selection."""
-        # Clear existing
-        for widget in self.content.winfo_children():
-            widget.destroy()
-        self.spread_labels = []
-
-        if not pages:
-            ttk.Label(self.content, text="No pages selected").pack()
+    def show_page(self, page_num: int):
+        """Show a larger preview of the specified page."""
+        if not self.cache or page_num == self.current_page:
             return
 
-        # Calculate booklet order
+        if page_num < 1 or page_num > self.cache.total_pages:
+            return
+
+        self.current_page = page_num
+        self.header.configure(text=f"Page {page_num} of {self.cache.total_pages}")
+
+        # Render page at larger size
         try:
-            signatures = calculate_booklet_order(pages, num_signatures, reading_order)
+            page = self.cache.pdf[page_num - 1]
+            page_width = page.get_width()
+            page_height = page.get_height()
+
+            # Calculate scale to fit preview size while maintaining aspect ratio
+            scale_w = self.PREVIEW_SIZE[0] / page_width
+            scale_h = self.PREVIEW_SIZE[1] / page_height
+            scale = min(scale_w, scale_h)
+
+            bitmap = page.render(scale=scale)
+            pil_image = bitmap.to_pil()
+
+            # Center the image in the preview area
+            result = Image.new('RGB', self.PREVIEW_SIZE, '#f0f0f0')
+            x = (self.PREVIEW_SIZE[0] - pil_image.width) // 2
+            y = (self.PREVIEW_SIZE[1] - pil_image.height) // 2
+            result.paste(pil_image, (x, y))
+
+            # Convert to PhotoImage and display
+            self.photo_image = ImageTk.PhotoImage(result)
+
+            # Hide placeholder, show image
+            self.canvas.itemconfigure(self.placeholder_text, state='hidden')
+
+            if self.image_id:
+                self.canvas.itemconfigure(self.image_id, image=self.photo_image, state='normal')
+            else:
+                self.image_id = self.canvas.create_image(0, 0, anchor='nw', image=self.photo_image)
+
         except Exception as e:
-            ttk.Label(self.content, text=f"Error: {e}").pack()
-            return
+            self.header.configure(text=f"Error loading page {page_num}")
 
-        sheet_num = 1
-        for sig_idx, sig_sheets in enumerate(signatures):
-            if len(signatures) > 1:
-                sig_label = ttk.Label(self.content, text=f"Signature {sig_idx + 1}",
-                                     font=('TkDefaultFont', 9, 'bold'))
-                sig_label.pack(anchor='w', pady=(10, 5))
+    def clear(self):
+        """Clear the preview and show placeholder."""
+        self.current_page = None
+        self.header.configure(text="Hover over a page")
 
-            for front_left, front_right, back_left, back_right in sig_sheets:
-                frame = ttk.Frame(self.content)
-                frame.pack(fill='x', pady=2)
-
-                # Format page display
-                def fmt(p):
-                    if p == "blank":
-                        return "[blank]"
-                    return f"p{p}"
-
-                front_text = f"Sheet {sheet_num} Front:  {fmt(front_left)} | {fmt(front_right)}"
-                back_text = f"Sheet {sheet_num} Back:   {fmt(back_left)} | {fmt(back_right)}"
-
-                front_label = ttk.Label(frame, text=front_text, font=('Consolas', 9))
-                front_label.pack(anchor='w')
-                back_label = ttk.Label(frame, text=back_text, font=('Consolas', 9))
-                back_label.pack(anchor='w')
-
-                sheet_num += 1
+        # Show placeholder, hide image
+        self.canvas.itemconfigure(self.placeholder_text, state='normal')
+        if self.image_id:
+            self.canvas.itemconfigure(self.image_id, state='hidden')
 
 
 class BookListPanel(ttk.Frame):
@@ -780,19 +808,20 @@ class BookletMakerGUI(tk.Tk):
 
         self.thumbnail_grid = ThumbnailGrid(left_frame,
                                            on_selection_change=self._on_selection_change,
-                                           on_spread_change=self._on_spread_change)
+                                           on_spread_change=self._on_spread_change,
+                                           on_hover=self._on_page_hover)
         self.thumbnail_grid.pack(fill='both', expand=True)
 
         # Right panel - Preview and options
         right_frame = ttk.Frame(paned)
         paned.add(right_frame, weight=1)
 
-        # Spread preview
-        preview_frame = ttk.LabelFrame(right_frame, text="Booklet Layout")
+        # Page preview
+        preview_frame = ttk.LabelFrame(right_frame, text="Page Preview")
         preview_frame.pack(fill='both', expand=True, pady=(0, 10))
 
-        self.spread_preview = SpreadPreview(preview_frame)
-        self.spread_preview.pack(fill='both', expand=True)
+        self.page_preview = PagePreview(preview_frame)
+        self.page_preview.pack(fill='both', expand=True)
 
         # Bottom panel - Selection and options
         bottom_frame = ttk.Frame(self)
@@ -930,6 +959,10 @@ class BookletMakerGUI(tk.Tk):
                 pdfium.PdfDocument(pdf_for_display).__len__()
             )
 
+            # Connect the thumbnail cache to the page preview for hover
+            if self.thumbnail_grid.cache:
+                self.page_preview.set_cache(self.thumbnail_grid.cache)
+
             # Set default output folder only if not already set from config
             if not self.output_folder_var.get():
                 self.output_folder_var.set(str(Path(path).parent / "prints"))
@@ -976,6 +1009,10 @@ class BookletMakerGUI(tk.Tk):
             self.selection_builder.set_total_pages(
                 pdfium.PdfDocument(self.temp_pdf_path).__len__()
             )
+
+            # Update page preview with new cache
+            if self.thumbnail_grid.cache:
+                self.page_preview.set_cache(self.thumbnail_grid.cache)
 
             # Clear any existing selection since page numbers changed
             self.thumbnail_grid.clear_selection()
@@ -1076,16 +1113,13 @@ class BookletMakerGUI(tk.Tk):
             books[self.current_book_index]['selection'] = selection
             self.book_list.update_book(self.current_book_index, books[self.current_book_index])
 
-    def _update_preview(self):
-        """Update the spread preview."""
-        pages = self.selection_builder.get_pages()
-        order = self.reading_order.get()
-        try:
-            sigs = int(self.signatures.get())
-        except ValueError:
-            sigs = 1
+    def _on_page_hover(self, page_num: int):
+        """Handle hover over a page thumbnail."""
+        self.page_preview.show_page(page_num)
 
-        self.spread_preview.update_preview(pages, order, sigs)
+    def _update_preview(self):
+        """Legacy method - no longer used since we replaced booklet layout with page preview."""
+        pass
 
     def _generate(self):
         """Generate all booklets."""
