@@ -3,5 +3,6 @@
   "signatures": 1,
   "duplex_mode": "auto",
   "paper_size": "tabloid",
-  "output_folder": "I:/comics/Image Comics/fixed/prints"
+  "output_folder": "I:\\comics\\marvel\\Drax the Destroyer\\prints",
+  "default_crop_percent": 5.018587360594796
 }

@@ -37,6 +37,13 @@ except ImportError:
     print("Error: booklet_maker.py must be in the same directory")
     sys.exit(1)
 
+# Import centralized UI configuration
+from src.config import UITheme, THUMBNAIL_SIZE, PREVIEW_SIZE, GRID_COLUMNS
+
+# Import validators for business logic
+from src.validators import SpreadValidator
+from src.models import SpreadPair
+
 import json
 
 # Configuration file handling
@@ -45,7 +52,8 @@ DEFAULT_CONFIG = {
     "signatures": 1,
     "duplex_mode": "auto",
     "paper_size": DEFAULT_PAPER_SIZE,
-    "output_folder": ""
+    "output_folder": "",
+    "default_crop_percent": 5.0
 }
 
 def get_config_path() -> Path:
@@ -80,7 +88,7 @@ def save_config(config: dict) -> None:
 class ThumbnailCache:
     """Manages PDF page thumbnails with lazy loading."""
 
-    def __init__(self, pdf_path: str, thumb_size: Tuple[int, int] = (100, 140)):
+    def __init__(self, pdf_path: str, thumb_size: Tuple[int, int] = THUMBNAIL_SIZE):
         self.pdf_path = pdf_path
         self.thumb_size = thumb_size
         self.pdf = pdfium.PdfDocument(pdf_path)
@@ -134,20 +142,25 @@ class ThumbnailCache:
 class ThumbnailGrid(ttk.Frame):
     """Scrollable grid of page thumbnails with selection support."""
 
-    def __init__(self, parent, on_selection_change=None, on_spread_change=None, on_hover=None):
+    def __init__(self, parent, on_selection_change=None, on_spread_change=None, on_hover=None, theme: UITheme = None, default_crop_percent: float = 5.0):
         super().__init__(parent)
         self.on_selection_change = on_selection_change
         self.on_spread_change = on_spread_change
         self.on_hover = on_hover
+        self.theme = theme or UITheme()  # Use provided theme or default
         self.cache: Optional[ThumbnailCache] = None
         self.photo_images = {}  # Keep references to prevent GC
         self.selected_pages = []  # Ordered list of selected page numbers
         self.thumb_labels = {}  # page_num -> label widget
-        self.columns = 6
+        self.columns = GRID_COLUMNS  # Use centralized grid column count
 
         # Spread tracking
         self.spread_pairs = []  # List of (page1, page2) tuples for double-page spreads
         self.pending_spread_page = None  # First page of incomplete spread marking
+
+        # Crop tracking
+        self.page_crops = {}  # {page_num: crop_percent} - tracks pages with bottom crops
+        self.default_crop_percent = default_crop_percent  # Default crop for new pages
 
         # Create scrollable canvas
         self.canvas = tk.Canvas(self, bg='#f0f0f0')
@@ -227,6 +240,7 @@ class ThumbnailGrid(ttk.Frame):
         label.bind("<Shift-Button-1>", lambda e, p=page_num: self._on_shift_click(p, e))
         label.bind("<Control-Button-1>", lambda e, p=page_num: self._on_ctrl_click(p, e))
         label.bind("<Enter>", lambda e, p=page_num: self._on_hover(p))
+        label.bind("<Button-3>", lambda e, p=page_num: self._on_right_click(p, e))  # Right-click menu
 
         # Page number label
         num_label = ttk.Label(frame, text=str(page_num))
@@ -236,7 +250,10 @@ class ThumbnailGrid(ttk.Frame):
 
         # Apply spread highlighting immediately if this page is in a spread pair
         if self._is_page_in_spread(page_num):
-            label.configure(highlightbackground='#FFEB3B', highlightthickness=3)
+            label.configure(
+                highlightbackground=self.theme.color_spread,
+                highlightthickness=self.theme.highlight_thickness
+            )
 
     def _is_page_in_spread(self, page_num: int) -> bool:
         """Check if a page is part of any spread pair."""
@@ -328,6 +345,100 @@ class ThumbnailGrid(ttk.Frame):
         if self.on_hover:
             self.on_hover(page_num)
 
+    def _on_right_click(self, page_num: int, event):
+        """Show context menu on right-click."""
+        menu = tk.Menu(self, tearoff=0)
+        menu.add_command(
+            label="Trim Bottom...",
+            command=lambda: self._show_crop_dialog(page_num)
+        )
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _show_crop_dialog(self, page_num: int):
+        """Open crop dialog for page."""
+        if self.cache is None:
+            return
+
+        current_crop = self.page_crops.get(page_num, self.default_crop_percent)
+
+        dialog = CropDialog(
+            parent=self.master,
+            page_num=page_num,
+            pdf_cache=self.cache,
+            initial_crop_percent=current_crop,
+            on_apply=lambda pct: self._apply_crop(page_num, pct)
+        )
+
+    def _apply_crop(self, page_num: int, crop_percent: float):
+        """Store crop data and update visual indicator."""
+        if crop_percent > 0:
+            self.page_crops[page_num] = crop_percent
+
+            # Remember this as the new default for future crops
+            self.default_crop_percent = crop_percent
+
+            # Update thumbnail to show cropped version
+            self._update_thumbnail_with_crop(page_num, crop_percent)
+
+            # Add purple border to indicate cropped page
+            if page_num in self.thumb_labels:
+                self.thumb_labels[page_num].configure(
+                    highlightbackground=self.theme.color_crop,
+                    highlightthickness=self.theme.highlight_thickness
+                )
+        else:
+            # Remove crop if set to 0%
+            self.page_crops.pop(page_num, None)
+
+            # Restore original thumbnail
+            self._restore_original_thumbnail(page_num)
+
+            if page_num in self.thumb_labels:
+                # Reset to default appearance
+                self._update_selection_display()
+
+    def get_page_crops(self) -> dict:
+        """Get dictionary of page crops for booklet generation."""
+        return self.page_crops.copy()
+
+    def _update_thumbnail_with_crop(self, page_num: int, crop_percent: float):
+        """Update thumbnail to show cropped version."""
+        if self.cache is None or page_num not in self.thumb_labels:
+            return
+
+        # Get original cached thumbnail
+        thumb = self.cache.get_thumbnail(page_num)
+        if thumb is None:
+            return
+
+        # Apply crop using CropService
+        from src.services.crop_service import CropService
+        crop_service = CropService()
+        cropped_thumb = crop_service.crop_image(thumb, crop_percent)
+
+        # Convert to PhotoImage and update label
+        photo = ImageTk.PhotoImage(cropped_thumb)
+        self.photo_images[page_num] = photo  # Keep reference
+        self.thumb_labels[page_num].configure(image=photo)
+
+    def _restore_original_thumbnail(self, page_num: int):
+        """Restore original uncropped thumbnail."""
+        if self.cache is None or page_num not in self.thumb_labels:
+            return
+
+        # Get original cached thumbnail (uncropped)
+        thumb = self.cache.get_thumbnail(page_num)
+        if thumb is None:
+            return
+
+        # Convert to PhotoImage and update label
+        photo = ImageTk.PhotoImage(thumb)
+        self.photo_images[page_num] = photo  # Keep reference
+        self.thumb_labels[page_num].configure(image=photo)
+
     def _update_selection_display(self):
         """Update visual indication of selected pages."""
         # Count occurrences of each page
@@ -344,13 +455,22 @@ class ThumbnailGrid(ttk.Frame):
         for page_num, label in self.thumb_labels.items():
             if page_num == self.pending_spread_page:
                 # Pending spread page - orange to indicate waiting for second page
-                label.configure(highlightbackground='#FF9800', highlightthickness=3)
+                label.configure(
+                    highlightbackground=self.theme.color_pending,
+                    highlightthickness=self.theme.highlight_thickness
+                )
             elif page_num in spread_pages:
                 # Spread pair - yellow
-                label.configure(highlightbackground='#FFEB3B', highlightthickness=3)
+                label.configure(
+                    highlightbackground=self.theme.color_spread,
+                    highlightthickness=self.theme.highlight_thickness
+                )
             elif page_num in counts:
                 # Selected - green
-                label.configure(highlightbackground='#4CAF50', highlightthickness=3)
+                label.configure(
+                    highlightbackground=self.theme.color_selected,
+                    highlightthickness=self.theme.highlight_thickness
+                )
             else:
                 # Not selected
                 label.configure(highlightbackground='#f0f0f0', highlightthickness=0)
@@ -375,33 +495,25 @@ class ThumbnailGrid(ttk.Frame):
         """
         Check if marked spreads will print correctly aligned.
 
+        NOTE: This method now delegates to SpreadValidator for testable business logic.
+
         Args:
             pages: List of page numbers/blanks in selection order
 
         Returns:
             List of (spread_pair, pos1, pos2) for misaligned spreads
         """
+        # Convert tuples to SpreadPair objects for validation
+        spread_objects = [SpreadPair(p1, p2) for p1, p2 in self.spread_pairs]
+
+        # Use validator for business logic (testable!)
+        results = SpreadValidator.check_spread_alignment(pages, spread_objects)
+
+        # Filter to only misaligned spreads and convert back to expected format
         misaligned = []
-
-        for pair in self.spread_pairs:
-            p1, p2 = pair
-
-            # Find positions of both pages in the selection
-            try:
-                pos1 = pages.index(p1)
-                pos2 = pages.index(p2)
-            except ValueError:
-                # One or both pages not in selection
-                continue
-
-            # For a spread to print correctly, pages must be at positions
-            # where first is at odd index and second is at odd+1
-            # (0-indexed: positions 1,2 or 3,4 or 5,6 etc.)
-            is_aligned = (pos1 % 2 == 1 and pos2 == pos1 + 1) or \
-                         (pos2 % 2 == 1 and pos1 == pos2 + 1)
-
+        for spread, pos1, pos2, is_aligned in results:
             if not is_aligned:
-                misaligned.append((pair, pos1, pos2))
+                misaligned.append((spread.as_tuple(), pos1, pos2))
 
         return misaligned
 
@@ -409,7 +521,8 @@ class ThumbnailGrid(ttk.Frame):
 class PagePreview(ttk.Frame):
     """Shows a larger preview of the currently hovered page."""
 
-    PREVIEW_SIZE = (350, 500)  # Width, Height for preview
+    # Use centralized preview size from config
+    # PREVIEW_SIZE is now imported from src.config
 
     def __init__(self, parent):
         super().__init__(parent)
@@ -423,12 +536,12 @@ class PagePreview(ttk.Frame):
         self.header.pack(pady=(0, 10))
 
         # Canvas to display the page image
-        self.canvas = tk.Canvas(self, width=self.PREVIEW_SIZE[0], height=self.PREVIEW_SIZE[1], bg='#f0f0f0')
+        self.canvas = tk.Canvas(self, width=PREVIEW_SIZE[0], height=PREVIEW_SIZE[1], bg='#f0f0f0')
         self.canvas.pack(fill='both', expand=True)
 
         # Create placeholder text
         self.placeholder_text = self.canvas.create_text(
-            self.PREVIEW_SIZE[0] // 2, self.PREVIEW_SIZE[1] // 2,
+            PREVIEW_SIZE[0] // 2, PREVIEW_SIZE[1] // 2,
             text="Hover over a page\nto preview",
             font=('TkDefaultFont', 12),
             fill='#888888',
@@ -459,17 +572,17 @@ class PagePreview(ttk.Frame):
             page_height = page.get_height()
 
             # Calculate scale to fit preview size while maintaining aspect ratio
-            scale_w = self.PREVIEW_SIZE[0] / page_width
-            scale_h = self.PREVIEW_SIZE[1] / page_height
+            scale_w = PREVIEW_SIZE[0] / page_width
+            scale_h = PREVIEW_SIZE[1] / page_height
             scale = min(scale_w, scale_h)
 
             bitmap = page.render(scale=scale)
             pil_image = bitmap.to_pil()
 
             # Center the image in the preview area
-            result = Image.new('RGB', self.PREVIEW_SIZE, '#f0f0f0')
-            x = (self.PREVIEW_SIZE[0] - pil_image.width) // 2
-            y = (self.PREVIEW_SIZE[1] - pil_image.height) // 2
+            result = Image.new('RGB', PREVIEW_SIZE, '#f0f0f0')
+            x = (PREVIEW_SIZE[0] - pil_image.width) // 2
+            y = (PREVIEW_SIZE[1] - pil_image.height) // 2
             result.paste(pil_image, (x, y))
 
             # Convert to PhotoImage and display
@@ -495,6 +608,105 @@ class PagePreview(ttk.Frame):
         self.canvas.itemconfigure(self.placeholder_text, state='normal')
         if self.image_id:
             self.canvas.itemconfigure(self.image_id, state='hidden')
+
+
+class CropDialog(tk.Toplevel):
+    """Dialog for adjusting page crop with live preview."""
+
+    def __init__(self, parent, page_num: int, pdf_cache,
+                 initial_crop_percent: float = 0.0, on_apply=None):
+        super().__init__(parent)
+        self.title(f"Trim Bottom - Page {page_num}")
+        self.geometry("500x450")
+        self.transient(parent)
+        self.grab_set()
+
+        self.page_num = page_num
+        self.pdf_cache = pdf_cache
+        self.on_apply = on_apply
+        self.crop_percent = tk.DoubleVar(value=initial_crop_percent)
+
+        # Render original page once (cached for performance)
+        page = pdf_cache.pdf[page_num - 1]
+        bitmap = page.render(scale=2.0)
+        self.original_image = bitmap.to_pil()
+
+        self._create_ui()
+        self._update_preview()
+
+    def _create_ui(self):
+        """Create dialog UI with side-by-side previews and slider."""
+        # Top: Side-by-side previews
+        preview_frame = ttk.Frame(self)
+        preview_frame.pack(fill='both', expand=True, padx=10, pady=10)
+
+        # Left: Original preview
+        left_frame = ttk.LabelFrame(preview_frame, text="Original")
+        left_frame.pack(side='left', fill='both', expand=True, padx=5)
+        self.original_canvas = tk.Canvas(left_frame, width=200, height=300, bg='white')
+        self.original_canvas.pack()
+
+        # Right: Cropped preview
+        right_frame = ttk.LabelFrame(preview_frame, text="Cropped Preview")
+        right_frame.pack(side='left', fill='both', expand=True, padx=5)
+        self.cropped_canvas = tk.Canvas(right_frame, width=200, height=300, bg='white')
+        self.cropped_canvas.pack()
+
+        # Middle: Slider
+        slider_frame = ttk.Frame(self)
+        slider_frame.pack(fill='x', padx=10, pady=10)
+
+        ttk.Label(slider_frame, text="Crop from bottom:").pack(side='left', padx=5)
+        self.percent_label = ttk.Label(slider_frame, text=f"{self.crop_percent.get():.1f}%", width=8)
+        self.percent_label.pack(side='right', padx=5)
+
+        slider = ttk.Scale(slider_frame, from_=0, to=30, orient='horizontal',
+                          variable=self.crop_percent, command=self._on_slider_change)
+        slider.pack(fill='x', expand=True, padx=10)
+
+        # Bottom: Buttons
+        btn_frame = ttk.Frame(self)
+        btn_frame.pack(fill='x', padx=10, pady=10)
+        ttk.Button(btn_frame, text="Apply", command=self._on_apply_click).pack(side='right', padx=5)
+        ttk.Button(btn_frame, text="Cancel", command=self.destroy).pack(side='right')
+
+    def _on_slider_change(self, value):
+        """Handle slider movement - update label and preview."""
+        self.percent_label.config(text=f"{float(value):.1f}%")
+        self._update_preview()
+
+    def _update_preview(self):
+        """Update both original and cropped previews."""
+        from src.services.crop_service import CropService
+        crop_service = CropService()
+
+        # Show original
+        orig_resized = self._resize_for_preview(self.original_image.copy())
+        orig_photo = ImageTk.PhotoImage(orig_resized)
+        self.original_canvas.delete('all')
+        self.original_canvas.create_image(100, 150, image=orig_photo)
+        self.original_canvas.image = orig_photo  # Keep reference
+
+        # Show cropped
+        cropped = crop_service.crop_image(self.original_image, self.crop_percent.get())
+        crop_resized = self._resize_for_preview(cropped)
+        crop_photo = ImageTk.PhotoImage(crop_resized)
+        self.cropped_canvas.delete('all')
+        self.cropped_canvas.create_image(100, 150, image=crop_photo)
+        self.cropped_canvas.image = crop_photo  # Keep reference
+
+    def _resize_for_preview(self, image: Image.Image) -> Image.Image:
+        """Resize image to fit 200x300 preview while maintaining aspect ratio."""
+        # Make a copy to avoid modifying original
+        img_copy = image.copy()
+        img_copy.thumbnail((200, 300), Image.Resampling.LANCZOS)
+        return img_copy
+
+    def _on_apply_click(self):
+        """Apply button clicked - call callback and close."""
+        if self.on_apply:
+            self.on_apply(self.crop_percent.get())
+        self.destroy()
 
 
 class BookListPanel(ttk.Frame):
@@ -763,11 +975,15 @@ class BookletMakerGUI(tk.Tk):
 
         self.pdf_path = None  # Original file path (PDF or CBZ)
         self.temp_pdf_path = None  # Temp PDF path if CBZ was converted
+        self._temp_cropped_pdf = None  # Temp PDF path with crops applied
         self.current_book_index = 0
         self._updating_from_list = False  # Prevent recursive updates
 
         # Load saved configuration
         self.user_config = load_config()
+
+        # Create UI theme for consistent styling
+        self.theme = UITheme()
 
         self._create_menu()
         self._create_ui()
@@ -821,7 +1037,9 @@ class BookletMakerGUI(tk.Tk):
         self.thumbnail_grid = ThumbnailGrid(left_frame,
                                            on_selection_change=self._on_selection_change,
                                            on_spread_change=self._on_spread_change,
-                                           on_hover=self._on_page_hover)
+                                           on_hover=self._on_page_hover,
+                                           theme=self.theme,
+                                           default_crop_percent=self.user_config.get('default_crop_percent', 5.0))
         self.thumbnail_grid.pack(fill='both', expand=True)
 
         # Right panel - Preview and options
@@ -1067,7 +1285,8 @@ class BookletMakerGUI(tk.Tk):
             "signatures": int(self.signatures.get()),
             "duplex_mode": self.duplex_mode.get(),
             "paper_size": paper_size_key,
-            "output_folder": self.output_folder_var.get()
+            "output_folder": self.output_folder_var.get(),
+            "default_crop_percent": self.thumbnail_grid.default_crop_percent
         }
         save_config(config)
 
@@ -1165,11 +1384,45 @@ class BookletMakerGUI(tk.Tk):
             output_name = output_name.rsplit('_book', 1)[0]
 
         try:
+            # Determine input PDF (use temp_pdf_path if CBZ was converted)
+            input_pdf = self.temp_pdf_path if self.temp_pdf_path else self.pdf_path
+
+            # Get crop data from thumbnail grid
+            page_crops_dict = self.thumbnail_grid.get_page_crops()
+
+            # Apply crops if any exist
+            if page_crops_dict:
+                try:
+                    from src.services.crop_service import CropService
+                    from src.models import PageCropData
+
+                    # Convert dict to list of PageCropData
+                    crops = [
+                        PageCropData(page_num=pnum, crop_bottom_percent=pct)
+                        for pnum, pct in page_crops_dict.items()
+                    ]
+
+                    crop_service = CropService()
+                    cropped_pdf_path = crop_service.apply_crops_to_pdf(
+                        pdf_path=Path(input_pdf),
+                        crops=crops
+                    )
+
+                    # Track for cleanup
+                    self._temp_cropped_pdf = str(cropped_pdf_path)
+                    input_for_booklet = str(cropped_pdf_path)
+
+                except Exception as e:
+                    messagebox.showerror("Error", f"Failed to apply crops:\n{e}")
+                    return
+            else:
+                input_for_booklet = input_pdf
+
             # Convert display label back to paper size key
             paper_size_key = self.paper_size_keys.get(self.paper_size.get(), DEFAULT_PAPER_SIZE)
 
             output_files = generate_booklet(
-                input_path=self.pdf_path,
+                input_path=input_for_booklet,
                 page_selections=all_selections,
                 reading_order=self.reading_order.get(),
                 num_signatures=int(self.signatures.get()),
@@ -1188,6 +1441,15 @@ class BookletMakerGUI(tk.Tk):
 
         except Exception as e:
             messagebox.showerror("Error", f"Generation failed:\n{e}")
+
+        finally:
+            # Cleanup temp cropped PDF
+            if self._temp_cropped_pdf and os.path.exists(self._temp_cropped_pdf):
+                try:
+                    os.unlink(self._temp_cropped_pdf)
+                    self._temp_cropped_pdf = None
+                except:
+                    pass  # Best effort cleanup
 
 
 def main():
