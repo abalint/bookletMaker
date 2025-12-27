@@ -42,9 +42,17 @@ try:
 except ImportError:
     PYMUPDF_AVAILABLE = False
 
+# Import centralized constants
+from src.config import (
+    IMAGE_EXTENSIONS,
+    PAPER_SIZES,
+    DEFAULT_PAPER_SIZE,
+    SPLIT_WIDTH_MULTIPLIER
+)
 
-# Supported image extensions for CBZ extraction
-IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp'}
+# DEPRECATED: Constants have been moved to src.config for better maintainability.
+# The following imports maintain backward compatibility for any code that imports from this module.
+# Please update your imports to use: from src.config import PAPER_SIZES, etc.
 
 
 def cbz_to_pdf(cbz_path: str) -> str:
@@ -155,8 +163,8 @@ def split_double_pages(input_path: str, output_path: str = None) -> dict:
         width = rect.width
         height = rect.height
 
-        # Detect double-page spread: width > 1.5× standard width
-        if width > standard_width * 1.5:
+        # Detect double-page spread: width > threshold× standard width
+        if width > standard_width * SPLIT_WIDTH_MULTIPLIER:
             # This is a double-page spread - split it
             splits_made += 1
 
@@ -195,17 +203,8 @@ def split_double_pages(input_path: str, output_path: str = None) -> dict:
     }
 
 
-# Paper sizes in points (72 points per inch) - (width, height) in landscape orientation
-PAPER_SIZES = {
-    'tabloid': (17 * 72, 11 * 72),      # 11x17" (1224 x 792 pt)
-    'a3': (1190, 842),                   # A3 (16.5" x 11.7")
-    'letter': (11 * 72, 8.5 * 72),       # 8.5x11" (792 x 612 pt)
-    'a4': (842, 595),                    # A4 (11.7" x 8.3")
-    'legal': (14 * 72, 8.5 * 72),        # 8.5x14" (1008 x 612 pt)
-}
-
-# Default paper size
-DEFAULT_PAPER_SIZE = 'tabloid'
+# DEPRECATED: PAPER_SIZES and DEFAULT_PAPER_SIZE have been moved to src.config
+# They are now imported above for backward compatibility
 
 # Legacy constants for backwards compatibility
 SHEET_WIDTH = PAPER_SIZES[DEFAULT_PAPER_SIZE][0]
