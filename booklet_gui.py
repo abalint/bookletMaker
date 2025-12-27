@@ -349,7 +349,7 @@ class ThumbnailGrid(ttk.Frame):
         """Show context menu on right-click."""
         menu = tk.Menu(self, tearoff=0)
         menu.add_command(
-            label="Trim Bottom...",
+            label="Trim...",
             command=lambda: self._show_crop_dialog(page_num)
         )
         try:
@@ -1000,7 +1000,7 @@ class BookletMakerGUI(tk.Tk):
         menubar = tk.Menu(self)
 
         file_menu = tk.Menu(menubar, tearoff=0)
-        file_menu.add_command(label="Open PDF...", command=self._open_pdf, accelerator="Ctrl+O")
+        file_menu.add_command(label="Open...", command=self._open_pdf, accelerator="Ctrl+O")
         file_menu.add_separator()
         file_menu.add_command(label="Exit", command=self.quit)
         menubar.add_cascade(label="File", menu=file_menu)
@@ -1017,7 +1017,7 @@ class BookletMakerGUI(tk.Tk):
         self.file_label = ttk.Label(top_frame, text="No PDF loaded")
         self.file_label.pack(side='left')
 
-        ttk.Button(top_frame, text="Open PDF", command=self._open_pdf).pack(side='left', padx=10)
+        ttk.Button(top_frame, text="Open", command=self._open_pdf).pack(side='left', padx=10)
 
         # Split double pages button (only if PyMuPDF available)
         if PYMUPDF_AVAILABLE:
