@@ -186,6 +186,7 @@ class ThumbnailGrid(ttk.Frame):
 
         self.cache = ThumbnailCache(pdf_path)
         self.selected_pages = []
+        self.spread_pairs = []
         self.photo_images = {}
         self.thumb_labels = {}
 
@@ -232,6 +233,17 @@ class ThumbnailGrid(ttk.Frame):
         num_label.pack()
 
         self.thumb_labels[page_num] = label
+
+        # Apply spread highlighting immediately if this page is in a spread pair
+        if self._is_page_in_spread(page_num):
+            label.configure(highlightbackground='#FFEB3B', highlightthickness=3)
+
+    def _is_page_in_spread(self, page_num: int) -> bool:
+        """Check if a page is part of any spread pair."""
+        for p1, p2 in self.spread_pairs:
+            if page_num == p1 or page_num == p2:
+                return True
+        return False
 
     def _rebuild_grid(self):
         """Rebuild the grid layout with current column count."""
@@ -1018,11 +1030,19 @@ class BookletMakerGUI(tk.Tk):
             self.thumbnail_grid.clear_selection()
             self.selection_builder.set_selection_string("")
 
+            # Auto-mark split pairs as spreads
+            if result.get('split_pairs'):
+                self.thumbnail_grid.spread_pairs = result['split_pairs'].copy()
+                # Highlighting is applied during thumbnail creation in _add_thumbnail()
+                # Just trigger alignment validation
+                self._on_spread_change(result['split_pairs'])
+
             self.file_label.configure(text=f"{Path(self.pdf_path).name}")
             messagebox.showinfo(
                 "Split Complete",
                 f"Split {result['splits_made']} double-page spread(s).\n"
-                f"Pages: {result['original_pages']} → {result['output_pages']}"
+                f"Pages: {result['original_pages']} → {result['output_pages']}\n"
+                f"Automatically marked {len(result.get('split_pairs', []))} spread pair(s)."
             )
 
         except Exception as e:

@@ -140,6 +140,8 @@ def split_double_pages(input_path: str, output_path: str = None) -> dict:
     new_doc = fitz.open()  # Create empty document
 
     splits_made = 0
+    split_pairs = []  # Track which output pages are split pairs
+    output_page_num = 0  # Track current output page number
     original_pages = len(doc)
 
     # Find the most common page width (standard width)
@@ -158,6 +160,9 @@ def split_double_pages(input_path: str, output_path: str = None) -> dict:
             # This is a double-page spread - split it
             splits_made += 1
 
+            # Record the split pair (1-indexed for user-facing page numbers)
+            split_pairs.append((output_page_num + 1, output_page_num + 2))
+
             # Left half
             left_rect = fitz.Rect(0, 0, width / 2, height)
             left_page = new_doc.new_page(width=width / 2, height=height)
@@ -167,9 +172,14 @@ def split_double_pages(input_path: str, output_path: str = None) -> dict:
             right_rect = fitz.Rect(width / 2, 0, width, height)
             right_page = new_doc.new_page(width=width / 2, height=height)
             right_page.show_pdf_page(right_page.rect, doc, page_num, clip=right_rect)
+
+            # Increment by 2 since we added two pages
+            output_page_num += 2
         else:
             # Normal page - copy as-is
             new_doc.insert_pdf(doc, from_page=page_num, to_page=page_num)
+            # Increment by 1 for normal page
+            output_page_num += 1
 
     # Save the new document
     new_doc.save(output_path, garbage=4, deflate=True)
@@ -180,6 +190,7 @@ def split_double_pages(input_path: str, output_path: str = None) -> dict:
         'original_pages': original_pages,
         'output_pages': original_pages + splits_made,
         'splits_made': splits_made,
+        'split_pairs': split_pairs,
         'output_path': output_path
     }
 
