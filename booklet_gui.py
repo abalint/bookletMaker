@@ -427,8 +427,11 @@ class ThumbnailGrid(ttk.Frame):
             self._restore_original_thumbnail(page_num)
 
             if page_num in self.thumb_labels:
-                # Reset to default appearance
-                self._update_selection_display()
+                # Reset border for this thumbnail only
+                self.thumb_labels[page_num].configure(
+                    highlightbackground='#f0f0f0',
+                    highlightthickness=0
+                )
 
     def get_page_crops(self) -> dict:
         """Get dictionary of page crops for booklet generation."""
