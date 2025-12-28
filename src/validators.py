@@ -136,8 +136,8 @@ class SpreadValidator:
         result = ValidationResult(is_valid=True)
 
         # Validate signatures
-        if num_signatures < 1:
-            result.add_error("Number of signatures must be at least 1")
+        if num_signatures < 0:
+            result.add_error("Number of signatures must be at least 0 (0=flat PDF)")
         elif num_signatures > 10:
             result.add_warning(
                 f"Very large number of signatures ({num_signatures}) may result in thin, fragile booklets"
@@ -147,7 +147,7 @@ class SpreadValidator:
         if reading_order not in ('western', 'manga'):
             result.add_error(f"Invalid reading order: '{reading_order}'. Must be 'western' or 'manga'")
 
-        # Warn about signature distribution
+        # Warn about signature distribution (skip for flat PDF mode)
         if num_pages > 0 and num_signatures > 1:
             pages_per_sig = num_pages / num_signatures
             if pages_per_sig < 4:

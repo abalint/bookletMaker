@@ -1579,10 +1579,13 @@ class BookletMakerGUI(tk.Tk):
 
         # Signatures
         ttk.Label(opts_inner, text="Signatures:").grid(row=0, column=2, padx=5)
-        self.signatures = ttk.Spinbox(opts_inner, from_=1, to=10, width=5)
+        self.signatures = ttk.Spinbox(opts_inner, from_=0, to=10, width=5)
         self.signatures.set(self.user_config['signatures'])
         self.signatures.grid(row=0, column=3, padx=5)
         self.signatures.bind('<KeyRelease>', lambda e: self._update_preview())
+        # Add hint label
+        ttk.Label(opts_inner, text="(0=flat PDF)", font=('TkDefaultFont', 8),
+                  foreground='#666').grid(row=1, column=2, columnspan=2, sticky='w', padx=5)
 
         # Duplex
         ttk.Label(opts_inner, text="Duplex:").grid(row=0, column=4, padx=5)
@@ -2226,21 +2229,28 @@ class BookletMakerGUI(tk.Tk):
 
             # Convert display label back to paper size key
             paper_size_key = self.paper_size_keys.get(self.paper_size.get(), DEFAULT_PAPER_SIZE)
+            num_sigs = int(self.signatures.get())
 
             output_files = generate_booklet(
                 input_path=input_for_booklet,
                 page_selections=all_selections,
                 reading_order=self.reading_order.get(),
-                num_signatures=int(self.signatures.get()),
+                num_signatures=num_sigs,
                 duplex_mode=self.duplex_mode.get(),
                 output_name=output_name,
                 paper_size=paper_size_key,
                 output_dir=self.output_folder_var.get() or None
             )
 
-            messagebox.showinfo("Success",
-                               f"Generated {len(output_files)} files:\n" +
-                               "\n".join(Path(f).name for f in output_files))
+            # Show appropriate success message
+            if num_sigs == 0:
+                messagebox.showinfo("Success",
+                                   f"Generated flat PDF:\n" +
+                                   "\n".join(Path(f).name for f in output_files))
+            else:
+                messagebox.showinfo("Success",
+                                   f"Generated {len(output_files)} booklet file(s):\n" +
+                                   "\n".join(Path(f).name for f in output_files))
 
             # Save settings after successful generation
             self._save_config()

@@ -53,8 +53,8 @@ class BookletOptions:
 
     def __post_init__(self):
         """Validate options."""
-        if self.num_signatures < 1:
-            raise ValueError("num_signatures must be >= 1")
+        if self.num_signatures < 0:
+            raise ValueError("num_signatures must be >= 0 (0=flat PDF)")
         if self.num_signatures > 10:
             raise ValueError("num_signatures must be <= 10")
 
