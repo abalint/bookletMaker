@@ -4,5 +4,5 @@
   "duplex_mode": "auto",
   "paper_size": "tabloid",
   "output_folder": "I:\\comics\\marvel\\Drax the Destroyer\\prints",
-  "default_crop_percent": 5.018587360594796
+  "default_crop": {"top": 0.0, "bottom": 0.0, "left": 0.0, "right": 0.0}
 }
