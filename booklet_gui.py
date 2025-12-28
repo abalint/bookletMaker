@@ -255,6 +255,7 @@ class ThumbnailGrid(ttk.Frame):
         label.bind("<Control-Button-1>", lambda e, p=page_num: self._on_ctrl_click(p, e))
         label.bind("<Enter>", lambda e, p=page_num: self._on_hover(p))
         label.bind("<Button-3>", lambda e, p=page_num: self._on_right_click(p, e))  # Right-click menu
+        label.bind("<Control-Button-3>", lambda e, p=page_num: self._on_ctrl_right_click(p, e))  # Quick apply default trim
 
         # Page number label
         num_label = ttk.Label(frame, text=str(page_num))
@@ -370,6 +371,12 @@ class ThumbnailGrid(ttk.Frame):
             menu.tk_popup(event.x_root, event.y_root)
         finally:
             menu.grab_release()
+
+    def _on_ctrl_right_click(self, page_num: int, event):
+        """Quick apply default trim on Ctrl+Right-click."""
+        has_default = any(self.default_crop.get(k, 0) > 0 for k in ['top', 'bottom', 'left', 'right'])
+        if has_default:
+            self._apply_crop(page_num, self.default_crop.copy(), False)
 
     def _show_crop_dialog(self, page_num: int):
         """Open crop dialog for page."""
