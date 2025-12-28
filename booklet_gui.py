@@ -53,7 +53,7 @@ DEFAULT_CONFIG = {
     "duplex_mode": "auto",
     "paper_size": DEFAULT_PAPER_SIZE,
     "output_folder": "",
-    "default_crop_percent": 5.0
+    "default_crop": {"top": 0.0, "bottom": 0.0, "left": 0.0, "right": 0.0}
 }
 
 def get_config_path() -> Path:
@@ -70,6 +70,20 @@ def load_config() -> dict:
                 # Merge with defaults to handle missing keys
                 config = DEFAULT_CONFIG.copy()
                 config.update(saved_config)
+
+                # Migration: Convert old single-value crop to new 4-sided format
+                if 'default_crop_percent' in config and 'default_crop' not in saved_config:
+                    old_value = config.pop('default_crop_percent', 0.0)
+                    config['default_crop'] = {
+                        'top': 0.0,
+                        'bottom': old_value,
+                        'left': 0.0,
+                        'right': 0.0
+                    }
+                elif 'default_crop_percent' in config:
+                    # Remove old key if new format is present
+                    config.pop('default_crop_percent', None)
+
                 return config
         except (json.JSONDecodeError, IOError):
             pass
@@ -142,7 +156,7 @@ class ThumbnailCache:
 class ThumbnailGrid(ttk.Frame):
     """Scrollable grid of page thumbnails with selection support."""
 
-    def __init__(self, parent, on_selection_change=None, on_spread_change=None, on_hover=None, theme: UITheme = None, default_crop_percent: float = 5.0):
+    def __init__(self, parent, on_selection_change=None, on_spread_change=None, on_hover=None, theme: UITheme = None, default_crop: dict = None):
         super().__init__(parent)
         self.on_selection_change = on_selection_change
         self.on_spread_change = on_spread_change
@@ -158,9 +172,9 @@ class ThumbnailGrid(ttk.Frame):
         self.spread_pairs = []  # List of (page1, page2) tuples for double-page spreads
         self.pending_spread_page = None  # First page of incomplete spread marking
 
-        # Crop tracking
-        self.page_crops = {}  # {page_num: crop_percent} - tracks pages with bottom crops
-        self.default_crop_percent = default_crop_percent  # Default crop for new pages
+        # Crop tracking - now supports 4-sided crops
+        self.page_crops = {}  # {page_num: {'top': x, 'bottom': y, 'left': z, 'right': w}}
+        self.default_crop = default_crop or {'top': 0.0, 'bottom': 0.0, 'left': 0.0, 'right': 0.0}
 
         # Create scrollable canvas
         self.canvas = tk.Canvas(self, bg='#f0f0f0')
@@ -362,26 +376,30 @@ class ThumbnailGrid(ttk.Frame):
         if self.cache is None:
             return
 
-        current_crop = self.page_crops.get(page_num, self.default_crop_percent)
+        current_crop = self.page_crops.get(page_num, self.default_crop.copy())
 
         dialog = CropDialog(
             parent=self.master,
             page_num=page_num,
             pdf_cache=self.cache,
-            initial_crop_percent=current_crop,
-            on_apply=lambda pct: self._apply_crop(page_num, pct)
+            initial_crops=current_crop,
+            default_crops=self.default_crop,
+            on_apply=lambda crops, set_default: self._apply_crop(page_num, crops, set_default)
         )
 
-    def _apply_crop(self, page_num: int, crop_percent: float):
+    def _apply_crop(self, page_num: int, crops: dict, set_as_default: bool = False):
         """Store crop data and update visual indicator."""
-        if crop_percent > 0:
-            self.page_crops[page_num] = crop_percent
+        has_any_crop = any(crops.get(k, 0) > 0 for k in ['top', 'bottom', 'left', 'right'])
 
-            # Remember this as the new default for future crops
-            self.default_crop_percent = crop_percent
+        if has_any_crop:
+            self.page_crops[page_num] = crops.copy()
+
+            # Update default if user checked "Set as default"
+            if set_as_default:
+                self.default_crop = crops.copy()
 
             # Update thumbnail to show cropped version
-            self._update_thumbnail_with_crop(page_num, crop_percent)
+            self._update_thumbnail_with_crop(page_num, crops)
 
             # Add purple border to indicate cropped page
             if page_num in self.thumb_labels:
@@ -390,7 +408,7 @@ class ThumbnailGrid(ttk.Frame):
                     highlightthickness=self.theme.highlight_thickness
                 )
         else:
-            # Remove crop if set to 0%
+            # Remove crop if all values are 0
             self.page_crops.pop(page_num, None)
 
             # Restore original thumbnail
@@ -404,7 +422,7 @@ class ThumbnailGrid(ttk.Frame):
         """Get dictionary of page crops for booklet generation."""
         return self.page_crops.copy()
 
-    def _update_thumbnail_with_crop(self, page_num: int, crop_percent: float):
+    def _update_thumbnail_with_crop(self, page_num: int, crops: dict):
         """Update thumbnail to show cropped version."""
         if self.cache is None or page_num not in self.thumb_labels:
             return
@@ -417,7 +435,13 @@ class ThumbnailGrid(ttk.Frame):
         # Apply crop using CropService
         from src.services.crop_service import CropService
         crop_service = CropService()
-        cropped_thumb = crop_service.crop_image(thumb, crop_percent)
+        cropped_thumb = crop_service.crop_image(
+            thumb,
+            crop_top_percent=crops.get('top', 0),
+            crop_bottom_percent=crops.get('bottom', 0),
+            crop_left_percent=crops.get('left', 0),
+            crop_right_percent=crops.get('right', 0)
+        )
 
         # Convert to PhotoImage and update label
         photo = ImageTk.PhotoImage(cropped_thumb)
@@ -611,22 +635,49 @@ class PagePreview(ttk.Frame):
 
 
 class CropDialog(tk.Toplevel):
-    """Dialog for adjusting page crop with live preview."""
+    """Dialog for adjusting page trim with draggable edges on all sides."""
+
+    EDGE_THRESHOLD = 8  # Pixels for edge detection
+    EDGE_COLOR = '#9C27B0'  # Purple
+    DEFAULT_EDGE_COLOR = '#666666'  # Gray for default indicators
+    OVERLAY_COLOR = '#9C27B0'  # Purple for overlay
+    CANVAS_WIDTH = 400
+    CANVAS_HEIGHT = 500
+    CANVAS_PADDING = 20
 
     def __init__(self, parent, page_num: int, pdf_cache,
-                 initial_crop_percent: float = 0.0, on_apply=None):
+                 initial_crops: dict = None, default_crops: dict = None, on_apply=None):
         super().__init__(parent)
-        self.title(f"Trim Bottom - Page {page_num}")
-        self.geometry("500x450")
+        self.title(f"Trim - Page {page_num}")
+        self.geometry("460x650")
         self.transient(parent)
         self.grab_set()
 
         self.page_num = page_num
         self.pdf_cache = pdf_cache
         self.on_apply = on_apply
-        self.crop_percent = tk.DoubleVar(value=initial_crop_percent)
+        self.default_crops = default_crops or {'top': 0.0, 'bottom': 0.0, 'left': 0.0, 'right': 0.0}
 
-        # Render original page once (cached for performance)
+        # Initialize crop values
+        initial = initial_crops or self.default_crops.copy()
+        self.crop_top = tk.DoubleVar(value=initial.get('top', 0.0))
+        self.crop_bottom = tk.DoubleVar(value=initial.get('bottom', 0.0))
+        self.crop_left = tk.DoubleVar(value=initial.get('left', 0.0))
+        self.crop_right = tk.DoubleVar(value=initial.get('right', 0.0))
+
+        # Set as default checkbox
+        self.set_as_default = tk.BooleanVar(value=False)
+
+        # Drag state
+        self.dragging_edge = None
+
+        # Image positioning (set during _update_preview)
+        self.image_x = 0
+        self.image_y = 0
+        self.image_width = 0
+        self.image_height = 0
+
+        # Render original page
         page = pdf_cache.pdf[page_num - 1]
         bitmap = page.render(scale=2.0)
         self.original_image = bitmap.to_pil()
@@ -635,78 +686,292 @@ class CropDialog(tk.Toplevel):
         self._update_preview()
 
     def _create_ui(self):
-        """Create dialog UI with side-by-side previews and slider."""
-        # Top: Side-by-side previews
-        preview_frame = ttk.Frame(self)
-        preview_frame.pack(fill='both', expand=True, padx=10, pady=10)
+        """Create dialog UI with interactive preview canvas."""
+        # Main canvas for interactive preview
+        canvas_frame = ttk.LabelFrame(self, text="Drag edges to trim")
+        canvas_frame.pack(fill='both', expand=True, padx=10, pady=10)
 
-        # Left: Original preview
-        left_frame = ttk.LabelFrame(preview_frame, text="Original")
-        left_frame.pack(side='left', fill='both', expand=True, padx=5)
-        self.original_canvas = tk.Canvas(left_frame, width=200, height=300, bg='white')
-        self.original_canvas.pack()
+        self.canvas = tk.Canvas(canvas_frame, width=self.CANVAS_WIDTH, height=self.CANVAS_HEIGHT, bg='#2d2d2d')
+        self.canvas.pack(fill='both', expand=True, padx=5, pady=5)
 
-        # Right: Cropped preview
-        right_frame = ttk.LabelFrame(preview_frame, text="Cropped Preview")
-        right_frame.pack(side='left', fill='both', expand=True, padx=5)
-        self.cropped_canvas = tk.Canvas(right_frame, width=200, height=300, bg='white')
-        self.cropped_canvas.pack()
+        # Bind mouse events
+        self.canvas.bind("<Motion>", self._on_mouse_move)
+        self.canvas.bind("<Button-1>", self._on_mouse_down)
+        self.canvas.bind("<B1-Motion>", self._on_drag)
+        self.canvas.bind("<ButtonRelease-1>", self._on_mouse_up)
 
-        # Middle: Slider
-        slider_frame = ttk.Frame(self)
-        slider_frame.pack(fill='x', padx=10, pady=10)
+        # Checkbox for default
+        self.default_check = ttk.Checkbutton(
+            self,
+            text="Set as default trim for future pages",
+            variable=self.set_as_default
+        )
+        self.default_check.pack(pady=5)
 
-        ttk.Label(slider_frame, text="Crop from bottom:").pack(side='left', padx=5)
-        self.percent_label = ttk.Label(slider_frame, text=f"{self.crop_percent.get():.1f}%", width=8)
-        self.percent_label.pack(side='right', padx=5)
-
-        slider = ttk.Scale(slider_frame, from_=0, to=30, orient='horizontal',
-                          variable=self.crop_percent, command=self._on_slider_change)
-        slider.pack(fill='x', expand=True, padx=10)
-
-        # Bottom: Buttons
+        # Button frame
         btn_frame = ttk.Frame(self)
         btn_frame.pack(fill='x', padx=10, pady=10)
-        ttk.Button(btn_frame, text="Apply", command=self._on_apply_click).pack(side='right', padx=5)
-        ttk.Button(btn_frame, text="Cancel", command=self.destroy).pack(side='right')
 
-    def _on_slider_change(self, value):
-        """Handle slider movement - update label and preview."""
-        self.percent_label.config(text=f"{float(value):.1f}%")
+        ttk.Button(btn_frame, text="Reset", command=self._on_reset).pack(side='left', padx=5)
+        ttk.Button(btn_frame, text="Cancel", command=self.destroy).pack(side='right', padx=5)
+        ttk.Button(btn_frame, text="Apply", command=self._on_apply_click).pack(side='right', padx=5)
+
+    def _get_edge_positions(self) -> dict:
+        """Get current edge positions in canvas coordinates."""
+        top_offset = int(self.image_height * self.crop_top.get() / 100)
+        bottom_offset = int(self.image_height * self.crop_bottom.get() / 100)
+        left_offset = int(self.image_width * self.crop_left.get() / 100)
+        right_offset = int(self.image_width * self.crop_right.get() / 100)
+
+        return {
+            'top': self.image_y + top_offset,
+            'bottom': self.image_y + self.image_height - bottom_offset,
+            'left': self.image_x + left_offset,
+            'right': self.image_x + self.image_width - right_offset
+        }
+
+    def _get_default_edge_positions(self) -> dict:
+        """Get default edge positions in canvas coordinates."""
+        top_offset = int(self.image_height * self.default_crops.get('top', 0) / 100)
+        bottom_offset = int(self.image_height * self.default_crops.get('bottom', 0) / 100)
+        left_offset = int(self.image_width * self.default_crops.get('left', 0) / 100)
+        right_offset = int(self.image_width * self.default_crops.get('right', 0) / 100)
+
+        return {
+            'top': self.image_y + top_offset,
+            'bottom': self.image_y + self.image_height - bottom_offset,
+            'left': self.image_x + left_offset,
+            'right': self.image_x + self.image_width - right_offset
+        }
+
+    def _detect_edge(self, x: int, y: int) -> Optional[str]:
+        """Detect which edge the mouse is near."""
+        edges = self._get_edge_positions()
+
+        # Check horizontal edges (top/bottom)
+        if self.image_x <= x <= self.image_x + self.image_width:
+            if abs(y - edges['top']) <= self.EDGE_THRESHOLD:
+                return 'top'
+            if abs(y - edges['bottom']) <= self.EDGE_THRESHOLD:
+                return 'bottom'
+
+        # Check vertical edges (left/right)
+        if self.image_y <= y <= self.image_y + self.image_height:
+            if abs(x - edges['left']) <= self.EDGE_THRESHOLD:
+                return 'left'
+            if abs(x - edges['right']) <= self.EDGE_THRESHOLD:
+                return 'right'
+
+        return None
+
+    def _on_mouse_move(self, event):
+        """Update cursor based on edge proximity."""
+        edge = self._detect_edge(event.x, event.y)
+
+        if edge in ('top', 'bottom'):
+            self.canvas.config(cursor='sb_v_double_arrow')
+        elif edge in ('left', 'right'):
+            self.canvas.config(cursor='sb_h_double_arrow')
+        else:
+            self.canvas.config(cursor='')
+
+    def _on_mouse_down(self, event):
+        """Start dragging if on an edge."""
+        self.dragging_edge = self._detect_edge(event.x, event.y)
+
+    def _on_drag(self, event):
+        """Handle drag movement."""
+        if not self.dragging_edge:
+            return
+
+        edges = self._get_edge_positions()
+        min_visible = 0.4  # 40% minimum visible
+
+        if self.dragging_edge == 'top':
+            # Constrain: can't go above image top or below (bottom edge - min_height)
+            min_pos = self.image_y
+            max_pos = edges['bottom'] - int(self.image_height * min_visible)
+            new_pos = max(min_pos, min(max_pos, event.y))
+
+            pixel_offset = new_pos - self.image_y
+            new_percent = (pixel_offset / self.image_height) * 100
+            self.crop_top.set(max(0, min(30, new_percent)))
+
+        elif self.dragging_edge == 'bottom':
+            # Constrain: can't go below image bottom or above (top edge + min_height)
+            min_pos = edges['top'] + int(self.image_height * min_visible)
+            max_pos = self.image_y + self.image_height
+            new_pos = max(min_pos, min(max_pos, event.y))
+
+            pixel_offset = (self.image_y + self.image_height) - new_pos
+            new_percent = (pixel_offset / self.image_height) * 100
+            self.crop_bottom.set(max(0, min(30, new_percent)))
+
+        elif self.dragging_edge == 'left':
+            # Constrain: can't go left of image or right of (right edge - min_width)
+            min_pos = self.image_x
+            max_pos = edges['right'] - int(self.image_width * min_visible)
+            new_pos = max(min_pos, min(max_pos, event.x))
+
+            pixel_offset = new_pos - self.image_x
+            new_percent = (pixel_offset / self.image_width) * 100
+            self.crop_left.set(max(0, min(30, new_percent)))
+
+        elif self.dragging_edge == 'right':
+            # Constrain: can't go right of image or left of (left edge + min_width)
+            min_pos = edges['left'] + int(self.image_width * min_visible)
+            max_pos = self.image_x + self.image_width
+            new_pos = max(min_pos, min(max_pos, event.x))
+
+            pixel_offset = (self.image_x + self.image_width) - new_pos
+            new_percent = (pixel_offset / self.image_width) * 100
+            self.crop_right.set(max(0, min(30, new_percent)))
+
         self._update_preview()
 
-    def _update_preview(self):
-        """Update both original and cropped previews."""
-        from src.services.crop_service import CropService
-        crop_service = CropService()
+    def _on_mouse_up(self, event):
+        """End dragging."""
+        self.dragging_edge = None
 
-        # Show original
-        orig_resized = self._resize_for_preview(self.original_image.copy())
-        orig_photo = ImageTk.PhotoImage(orig_resized)
-        self.original_canvas.delete('all')
-        self.original_canvas.create_image(100, 150, image=orig_photo)
-        self.original_canvas.image = orig_photo  # Keep reference
-
-        # Show cropped
-        cropped = crop_service.crop_image(self.original_image, self.crop_percent.get())
-        crop_resized = self._resize_for_preview(cropped)
-        crop_photo = ImageTk.PhotoImage(crop_resized)
-        self.cropped_canvas.delete('all')
-        self.cropped_canvas.create_image(100, 150, image=crop_photo)
-        self.cropped_canvas.image = crop_photo  # Keep reference
-
-    def _resize_for_preview(self, image: Image.Image) -> Image.Image:
-        """Resize image to fit 200x300 preview while maintaining aspect ratio."""
-        # Make a copy to avoid modifying original
-        img_copy = image.copy()
-        img_copy.thumbnail((200, 300), Image.Resampling.LANCZOS)
-        return img_copy
+    def _on_reset(self):
+        """Reset all crops to zero."""
+        self.crop_top.set(0)
+        self.crop_bottom.set(0)
+        self.crop_left.set(0)
+        self.crop_right.set(0)
+        self._update_preview()
 
     def _on_apply_click(self):
-        """Apply button clicked - call callback and close."""
+        """Apply crops and close."""
         if self.on_apply:
-            self.on_apply(self.crop_percent.get())
+            crops = {
+                'top': self.crop_top.get(),
+                'bottom': self.crop_bottom.get(),
+                'left': self.crop_left.get(),
+                'right': self.crop_right.get()
+            }
+            self.on_apply(crops, self.set_as_default.get())
         self.destroy()
+
+    def _update_preview(self):
+        """Update the interactive preview with overlays and edges."""
+        self.canvas.delete('all')
+
+        # Calculate scaled image size to fit canvas
+        canvas_inner_width = self.CANVAS_WIDTH - 2 * self.CANVAS_PADDING
+        canvas_inner_height = self.CANVAS_HEIGHT - 2 * self.CANVAS_PADDING
+
+        orig_width, orig_height = self.original_image.size
+        scale = min(canvas_inner_width / orig_width, canvas_inner_height / orig_height)
+
+        self.image_width = int(orig_width * scale)
+        self.image_height = int(orig_height * scale)
+        self.image_x = (self.CANVAS_WIDTH - self.image_width) // 2
+        self.image_y = (self.CANVAS_HEIGHT - self.image_height) // 2
+
+        # Create scaled image
+        scaled_image = self.original_image.resize(
+            (self.image_width, self.image_height),
+            Image.Resampling.LANCZOS
+        )
+        self.photo_image = ImageTk.PhotoImage(scaled_image)
+        self.canvas.create_image(self.image_x, self.image_y, anchor='nw', image=self.photo_image)
+
+        # Get edge positions
+        edges = self._get_edge_positions()
+        default_edges = self._get_default_edge_positions()
+
+        # Draw semi-transparent overlays for cropped regions
+        # Top overlay
+        if self.crop_top.get() > 0:
+            self.canvas.create_rectangle(
+                self.image_x, self.image_y,
+                self.image_x + self.image_width, edges['top'],
+                fill=self.OVERLAY_COLOR, stipple='gray50', outline=''
+            )
+
+        # Bottom overlay
+        if self.crop_bottom.get() > 0:
+            self.canvas.create_rectangle(
+                self.image_x, edges['bottom'],
+                self.image_x + self.image_width, self.image_y + self.image_height,
+                fill=self.OVERLAY_COLOR, stipple='gray50', outline=''
+            )
+
+        # Left overlay
+        if self.crop_left.get() > 0:
+            self.canvas.create_rectangle(
+                self.image_x, edges['top'],
+                edges['left'], edges['bottom'],
+                fill=self.OVERLAY_COLOR, stipple='gray50', outline=''
+            )
+
+        # Right overlay
+        if self.crop_right.get() > 0:
+            self.canvas.create_rectangle(
+                edges['right'], edges['top'],
+                self.image_x + self.image_width, edges['bottom'],
+                fill=self.OVERLAY_COLOR, stipple='gray50', outline=''
+            )
+
+        # Draw default edge indicators (dashed lines) if defaults exist
+        has_defaults = any(self.default_crops.get(k, 0) > 0 for k in ['top', 'bottom', 'left', 'right'])
+        if has_defaults:
+            if self.default_crops.get('top', 0) > 0:
+                self.canvas.create_line(
+                    self.image_x, default_edges['top'],
+                    self.image_x + self.image_width, default_edges['top'],
+                    fill=self.DEFAULT_EDGE_COLOR, dash=(4, 4), width=2
+                )
+            if self.default_crops.get('bottom', 0) > 0:
+                self.canvas.create_line(
+                    self.image_x, default_edges['bottom'],
+                    self.image_x + self.image_width, default_edges['bottom'],
+                    fill=self.DEFAULT_EDGE_COLOR, dash=(4, 4), width=2
+                )
+            if self.default_crops.get('left', 0) > 0:
+                self.canvas.create_line(
+                    default_edges['left'], self.image_y,
+                    default_edges['left'], self.image_y + self.image_height,
+                    fill=self.DEFAULT_EDGE_COLOR, dash=(4, 4), width=2
+                )
+            if self.default_crops.get('right', 0) > 0:
+                self.canvas.create_line(
+                    default_edges['right'], self.image_y,
+                    default_edges['right'], self.image_y + self.image_height,
+                    fill=self.DEFAULT_EDGE_COLOR, dash=(4, 4), width=2
+                )
+
+        # Draw current edge lines (solid, draggable)
+        edge_width = 4
+
+        # Top edge
+        self.canvas.create_line(
+            self.image_x, edges['top'],
+            self.image_x + self.image_width, edges['top'],
+            fill=self.EDGE_COLOR, width=edge_width
+        )
+
+        # Bottom edge
+        self.canvas.create_line(
+            self.image_x, edges['bottom'],
+            self.image_x + self.image_width, edges['bottom'],
+            fill=self.EDGE_COLOR, width=edge_width
+        )
+
+        # Left edge
+        self.canvas.create_line(
+            edges['left'], self.image_y,
+            edges['left'], self.image_y + self.image_height,
+            fill=self.EDGE_COLOR, width=edge_width
+        )
+
+        # Right edge
+        self.canvas.create_line(
+            edges['right'], self.image_y,
+            edges['right'], self.image_y + self.image_height,
+            fill=self.EDGE_COLOR, width=edge_width
+        )
 
 
 class BookListPanel(ttk.Frame):
@@ -1039,7 +1304,7 @@ class BookletMakerGUI(tk.Tk):
                                            on_spread_change=self._on_spread_change,
                                            on_hover=self._on_page_hover,
                                            theme=self.theme,
-                                           default_crop_percent=self.user_config.get('default_crop_percent', 5.0))
+                                           default_crop=self.user_config.get('default_crop', {'top': 0.0, 'bottom': 0.0, 'left': 0.0, 'right': 0.0}))
         self.thumbnail_grid.pack(fill='both', expand=True)
 
         # Right panel - Preview and options
@@ -1286,7 +1551,7 @@ class BookletMakerGUI(tk.Tk):
             "duplex_mode": self.duplex_mode.get(),
             "paper_size": paper_size_key,
             "output_folder": self.output_folder_var.get(),
-            "default_crop_percent": self.thumbnail_grid.default_crop_percent
+            "default_crop": self.thumbnail_grid.default_crop
         }
         save_config(config)
 
@@ -1398,8 +1663,8 @@ class BookletMakerGUI(tk.Tk):
 
                     # Convert dict to list of PageCropData
                     crops = [
-                        PageCropData(page_num=pnum, crop_bottom_percent=pct)
-                        for pnum, pct in page_crops_dict.items()
+                        PageCropData.from_dict(pnum, crop_data)
+                        for pnum, crop_data in page_crops_dict.items()
                     ]
 
                     crop_service = CropService()

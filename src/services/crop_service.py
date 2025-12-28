@@ -20,13 +20,23 @@ class CropService:
     and PIL-based image cropping for preview purposes.
     """
 
-    def crop_image(self, image: Image.Image, crop_bottom_percent: float) -> Image.Image:
+    def crop_image(
+        self,
+        image: Image.Image,
+        crop_top_percent: float = 0.0,
+        crop_bottom_percent: float = 0.0,
+        crop_left_percent: float = 0.0,
+        crop_right_percent: float = 0.0
+    ) -> Image.Image:
         """
-        Crop PIL Image from bottom by percentage (for dialog preview).
+        Crop PIL Image from all four sides by percentage (for dialog preview).
 
         Args:
             image: PIL Image to crop
+            crop_top_percent: Percentage of height to crop from top (0-30%)
             crop_bottom_percent: Percentage of height to crop from bottom (0-30%)
+            crop_left_percent: Percentage of width to crop from left (0-30%)
+            crop_right_percent: Percentage of width to crop from right (0-30%)
 
         Returns:
             Cropped PIL Image
@@ -34,16 +44,30 @@ class CropService:
         Example:
             >>> service = CropService()
             >>> img = Image.new('RGB', (100, 100))
-            >>> cropped = service.crop_image(img, 10.0)  # Crop 10% from bottom
+            >>> cropped = service.crop_image(img, crop_bottom_percent=10.0)
             >>> cropped.size
             (100, 90)
+            >>> cropped = service.crop_image(img, crop_top_percent=10.0, crop_bottom_percent=10.0,
+            ...                               crop_left_percent=10.0, crop_right_percent=10.0)
+            >>> cropped.size
+            (80, 80)
         """
         width, height = image.size
-        crop_pixels = int(height * crop_bottom_percent / 100)
-        new_height = height - crop_pixels
+
+        # Calculate pixel offsets
+        top_pixels = int(height * crop_top_percent / 100)
+        bottom_pixels = int(height * crop_bottom_percent / 100)
+        left_pixels = int(width * crop_left_percent / 100)
+        right_pixels = int(width * crop_right_percent / 100)
+
+        # New crop boundaries
+        new_left = left_pixels
+        new_top = top_pixels
+        new_right = width - right_pixels
+        new_bottom = height - bottom_pixels
 
         # Crop: (left, top, right, bottom)
-        return image.crop((0, 0, width, new_height))
+        return image.crop((new_left, new_top, new_right, new_bottom))
 
     def apply_crops_to_pdf(
         self,
@@ -108,13 +132,17 @@ class CropService:
                 # Get current page rectangle
                 rect = page.rect
 
-                # Calculate new rectangle (crop from bottom)
-                crop_height = rect.height * (crop.crop_bottom_percent / 100)
+                # Calculate crop amounts for all four sides
+                crop_top = rect.height * (crop.crop_top_percent / 100)
+                crop_bottom = rect.height * (crop.crop_bottom_percent / 100)
+                crop_left = rect.width * (crop.crop_left_percent / 100)
+                crop_right = rect.width * (crop.crop_right_percent / 100)
+
                 new_rect = fitz.Rect(
-                    rect.x0,                    # Left (unchanged)
-                    rect.y0,                    # Top (unchanged)
-                    rect.x1,                    # Right (unchanged)
-                    rect.y1 - crop_height       # Bottom (reduced)
+                    rect.x0 + crop_left,        # Left
+                    rect.y0 + crop_top,         # Top
+                    rect.x1 - crop_right,       # Right
+                    rect.y1 - crop_bottom       # Bottom
                 )
 
                 # Apply crop by setting CropBox

@@ -141,14 +141,87 @@ class PageCropData:
     """
     Crop settings for a single page.
 
-    Used to remove watermarks or unwanted content from the bottom of pages.
+    Supports cropping from all four sides. Each value represents the
+    percentage of the page dimension to remove from that edge.
     """
-    page_num: int               # Page number to crop (1-indexed)
-    crop_bottom_percent: float  # Percentage to crop from bottom (0-30%)
+    page_num: int                    # Page number to crop (1-indexed)
+    crop_top_percent: float = 0.0    # Percentage to crop from top (0-30%)
+    crop_bottom_percent: float = 0.0 # Percentage to crop from bottom (0-30%)
+    crop_left_percent: float = 0.0   # Percentage to crop from left (0-30%)
+    crop_right_percent: float = 0.0  # Percentage to crop from right (0-30%)
 
     def __post_init__(self):
         """Validate crop settings."""
-        if not 0 <= self.crop_bottom_percent <= 30:
-            raise ValueError(
-                f"crop_bottom_percent must be between 0 and 30, got {self.crop_bottom_percent}"
-            )
+        for field_name in ['crop_top_percent', 'crop_bottom_percent',
+                           'crop_left_percent', 'crop_right_percent']:
+            value = getattr(self, field_name)
+            if not 0 <= value <= 30:
+                raise ValueError(
+                    f"{field_name} must be between 0 and 30, got {value}"
+                )
+
+        # Ensure minimum visible area (at least 40% of each dimension)
+        if self.crop_top_percent + self.crop_bottom_percent > 60:
+            raise ValueError("Combined vertical crop cannot exceed 60%")
+        if self.crop_left_percent + self.crop_right_percent > 60:
+            raise ValueError("Combined horizontal crop cannot exceed 60%")
+
+    def has_crop(self) -> bool:
+        """Check if any cropping is applied."""
+        return any([
+            self.crop_top_percent > 0,
+            self.crop_bottom_percent > 0,
+            self.crop_left_percent > 0,
+            self.crop_right_percent > 0
+        ])
+
+    def to_dict(self) -> dict:
+        """Convert to dictionary for storage."""
+        return {
+            'top': self.crop_top_percent,
+            'bottom': self.crop_bottom_percent,
+            'left': self.crop_left_percent,
+            'right': self.crop_right_percent
+        }
+
+    @classmethod
+    def from_dict(cls, page_num: int, data: dict) -> 'PageCropData':
+        """Create from dictionary."""
+        return cls(
+            page_num=page_num,
+            crop_top_percent=data.get('top', 0.0),
+            crop_bottom_percent=data.get('bottom', 0.0),
+            crop_left_percent=data.get('left', 0.0),
+            crop_right_percent=data.get('right', 0.0)
+        )
+
+
+@dataclass
+class CropDefaults:
+    """Default crop values for new pages."""
+    top: float = 0.0
+    bottom: float = 0.0
+    left: float = 0.0
+    right: float = 0.0
+
+    def __post_init__(self):
+        """Validate default values."""
+        for field_name in ['top', 'bottom', 'left', 'right']:
+            value = getattr(self, field_name)
+            if not 0 <= value <= 30:
+                raise ValueError(f"{field_name} must be between 0 and 30, got {value}")
+
+    def to_dict(self) -> dict:
+        """Convert to dictionary for storage."""
+        return {'top': self.top, 'bottom': self.bottom,
+                'left': self.left, 'right': self.right}
+
+    @classmethod
+    def from_dict(cls, data: dict) -> 'CropDefaults':
+        """Create from dictionary."""
+        return cls(
+            top=data.get('top', 0.0),
+            bottom=data.get('bottom', 0.0),
+            left=data.get('left', 0.0),
+            right=data.get('right', 0.0)
+        )
