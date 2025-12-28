@@ -373,10 +373,15 @@ class ThumbnailGrid(ttk.Frame):
             menu.grab_release()
 
     def _on_ctrl_right_click(self, page_num: int, event):
-        """Quick apply default trim on Ctrl+Right-click."""
-        has_default = any(self.default_crop.get(k, 0) > 0 for k in ['top', 'bottom', 'left', 'right'])
-        if has_default:
-            self._apply_crop(page_num, self.default_crop.copy(), False)
+        """Toggle crop on Ctrl+Right-click."""
+        if page_num in self.page_crops:
+            # Page is cropped - reset to original
+            self._apply_crop(page_num, {'top': 0, 'bottom': 0, 'left': 0, 'right': 0}, False)
+        else:
+            # Page not cropped - apply default if one exists
+            has_default = any(self.default_crop.get(k, 0) > 0 for k in ['top', 'bottom', 'left', 'right'])
+            if has_default:
+                self._apply_crop(page_num, self.default_crop.copy(), False)
 
     def _show_crop_dialog(self, page_num: int):
         """Open crop dialog for page."""
