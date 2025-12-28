@@ -1264,6 +1264,7 @@ class BookletMakerGUI(tk.Tk):
 
         self.title("Booklet Maker GUI")
         self.geometry("1200x800")
+        self.minsize(900, 700)
 
         self.pdf_path = None  # Original file path (PDF or CBZ)
         self.temp_pdf_path = None  # Temp PDF path if CBZ was converted
@@ -1318,9 +1319,13 @@ class BookletMakerGUI(tk.Tk):
         self.progress = ttk.Progressbar(top_frame, length=200, mode='determinate')
         self.progress.pack(side='right')
 
-        # Main content - PanedWindow for resizable split
-        paned = ttk.PanedWindow(self, orient='horizontal')
-        paned.pack(fill='both', expand=True, padx=10, pady=5)
+        # Main vertical split - resizable between content and controls
+        main_paned = ttk.PanedWindow(self, orient='vertical')
+        main_paned.pack(fill='both', expand=True, padx=10, pady=5)
+
+        # Horizontal PanedWindow for PDF pages and preview
+        paned = ttk.PanedWindow(main_paned, orient='horizontal')
+        main_paned.add(paned, weight=3)
 
         # Left panel - Thumbnails
         left_frame = ttk.LabelFrame(paned, text="PDF Pages")
@@ -1334,7 +1339,7 @@ class BookletMakerGUI(tk.Tk):
                                            default_crop=self.user_config.get('default_crop', {'top': 0.0, 'bottom': 0.0, 'left': 0.0, 'right': 0.0}))
         self.thumbnail_grid.pack(fill='both', expand=True)
 
-        # Right panel - Preview and options
+        # Right panel - Preview
         right_frame = ttk.Frame(paned)
         paned.add(right_frame, weight=1)
 
@@ -1345,12 +1350,38 @@ class BookletMakerGUI(tk.Tk):
         self.page_preview = PagePreview(preview_frame)
         self.page_preview.pack(fill='both', expand=True)
 
-        # Bottom panel - Selection and options
-        bottom_frame = ttk.Frame(self)
-        bottom_frame.pack(fill='x', padx=10, pady=5)
+        # Bottom panel - Selection and options (with scrollbar)
+        bottom_frame = ttk.Frame(main_paned)
+        main_paned.add(bottom_frame, weight=1)
+
+        # Create scrollable canvas for bottom controls
+        bottom_canvas = tk.Canvas(bottom_frame, bg='#f0f0f0', highlightthickness=0)
+        bottom_scrollbar = ttk.Scrollbar(bottom_frame, orient="vertical", command=bottom_canvas.yview)
+        bottom_scrollable_frame = ttk.Frame(bottom_canvas)
+
+        bottom_scrollable_frame.bind(
+            "<Configure>",
+            lambda e: bottom_canvas.configure(scrollregion=bottom_canvas.bbox("all"))
+        )
+
+        bottom_canvas_frame = bottom_canvas.create_window((0, 0), window=bottom_scrollable_frame, anchor="nw")
+        bottom_canvas.configure(yscrollcommand=bottom_scrollbar.set)
+
+        # Bind mouse wheel for scrolling
+        def _on_bottom_mousewheel(event):
+            bottom_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        bottom_canvas.bind_all("<MouseWheel>", _on_bottom_mousewheel)
+
+        # Bind canvas resize to adjust scrollable frame width
+        def _on_bottom_canvas_resize(event):
+            bottom_canvas.itemconfig(bottom_canvas_frame, width=event.width)
+        bottom_canvas.bind("<Configure>", _on_bottom_canvas_resize)
+
+        bottom_canvas.pack(side="left", fill="both", expand=True)
+        bottom_scrollbar.pack(side="right", fill="y")
 
         # Book list and selection side by side
-        books_select_frame = ttk.Frame(bottom_frame)
+        books_select_frame = ttk.Frame(bottom_scrollable_frame)
         books_select_frame.pack(fill='x', pady=5)
 
         # Book list panel (left)
@@ -1370,7 +1401,7 @@ class BookletMakerGUI(tk.Tk):
         self.selection_builder.pack(fill='x', padx=5, pady=5)
 
         # Options
-        options_frame = ttk.LabelFrame(bottom_frame, text="Output Options")
+        options_frame = ttk.LabelFrame(bottom_scrollable_frame, text="Output Options")
         options_frame.pack(fill='x', pady=5)
 
         opts_inner = ttk.Frame(options_frame)
@@ -1417,7 +1448,7 @@ class BookletMakerGUI(tk.Tk):
         self.output_name.grid(row=0, column=9, padx=5)
 
         # Generate button and output folder
-        btn_frame = ttk.Frame(bottom_frame)
+        btn_frame = ttk.Frame(bottom_scrollable_frame)
         btn_frame.pack(fill='x', pady=10)
 
         ttk.Button(btn_frame, text="Generate All Books", command=self._generate).pack(side='right', padx=5)
