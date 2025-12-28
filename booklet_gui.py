@@ -585,7 +585,7 @@ class PagePreview(ttk.Frame):
         self.cache = cache
         self.clear()
 
-    def show_page(self, page_num: int):
+    def show_page(self, page_num: int, crops: dict = None):
         """Show a larger preview of the specified page."""
         if not self.cache or page_num == self.current_page:
             return
@@ -609,6 +609,18 @@ class PagePreview(ttk.Frame):
 
             bitmap = page.render(scale=scale)
             pil_image = bitmap.to_pil()
+
+            # Apply crop if present
+            if crops and any(crops.get(k, 0) > 0 for k in ['top', 'bottom', 'left', 'right']):
+                from src.services.crop_service import CropService
+                crop_service = CropService()
+                pil_image = crop_service.crop_image(
+                    pil_image,
+                    crop_top_percent=crops.get('top', 0),
+                    crop_bottom_percent=crops.get('bottom', 0),
+                    crop_left_percent=crops.get('left', 0),
+                    crop_right_percent=crops.get('right', 0)
+                )
 
             # Center the image in the preview area
             result = Image.new('RGB', PREVIEW_SIZE, '#f0f0f0')
@@ -1626,7 +1638,8 @@ class BookletMakerGUI(tk.Tk):
 
     def _on_page_hover(self, page_num: int):
         """Handle hover over a page thumbnail."""
-        self.page_preview.show_page(page_num)
+        crops = self.thumbnail_grid.page_crops.get(page_num)
+        self.page_preview.show_page(page_num, crops)
 
     def _update_preview(self):
         """Legacy method - no longer used since we replaced booklet layout with page preview."""
