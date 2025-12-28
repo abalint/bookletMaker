@@ -30,7 +30,7 @@ except ImportError:
 try:
     from booklet_maker import (
         generate_booklet, parse_page_selection, calculate_booklet_order,
-        PAPER_SIZES, DEFAULT_PAPER_SIZE, cbz_to_pdf,
+        PAPER_SIZES, DEFAULT_PAPER_SIZE, cbz_to_pdf, images_to_pdf,
         split_double_pages, PYMUPDF_AVAILABLE
     )
 except ImportError:
@@ -42,7 +42,7 @@ from src.config import UITheme, THUMBNAIL_SIZE, PREVIEW_SIZE, GRID_COLUMNS
 
 # Import validators for business logic
 from src.validators import SpreadValidator
-from src.models import SpreadPair
+from src.models import SpreadPair, LoadedFile
 
 import json
 
@@ -162,6 +162,10 @@ class ThumbnailGrid(ttk.Frame):
         self.on_spread_change = on_spread_change
         self.on_hover = on_hover
         self.theme = theme or UITheme()  # Use provided theme or default
+        # Multi-file support
+        self.caches = []  # List[ThumbnailCache] for multiple files
+        self.file_boundaries = []  # Virtual pages where files end
+        # Keep old cache for backward compatibility
         self.cache: Optional[ThumbnailCache] = None
         self.photo_images = {}  # Keep references to prevent GC
         self.selected_pages = []  # Ordered list of selected page numbers
@@ -189,15 +193,23 @@ class ThumbnailGrid(ttk.Frame):
         self.canvas_frame = self.canvas.create_window((0, 0), window=self.scrollable_frame, anchor="nw")
         self.canvas.configure(yscrollcommand=self.scrollbar.set)
 
-        # Bind mouse wheel
-        self.canvas.bind_all("<MouseWheel>", self._on_mousewheel)
+        # Bind mouse wheel to canvas
+        self.canvas.bind("<MouseWheel>", self._on_mousewheel)
         self.canvas.bind("<Configure>", self._on_canvas_resize)
 
         self.canvas.pack(side="left", fill="both", expand=True)
         self.scrollbar.pack(side="right", fill="y")
 
     def _on_mousewheel(self, event):
+        """Scroll canvas when mousewheel used."""
         self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+    def _bind_mousewheel_to_widget(self, widget):
+        """Bind mousewheel event to a widget (used for child widgets)."""
+        try:
+            widget.bind("<MouseWheel>", self._on_mousewheel, add="+")
+        except:
+            pass  # Skip widgets that don't support binding
 
     def _on_canvas_resize(self, event):
         # Update columns based on width
@@ -228,6 +240,58 @@ class ThumbnailGrid(ttk.Frame):
                 self.after(0, lambda p=i: self._add_thumbnail(p))
                 if progress_callback:
                     progress_callback(i, self.cache.total_pages)
+
+        threading.Thread(target=load_and_display, daemon=True).start()
+
+    def load_pdfs(self, loaded_files: List, progress_callback=None):
+        """Load multiple PDF files and create thumbnails with separation lines."""
+        # Close existing caches
+        for cache in self.caches:
+            cache.close()
+        if self.cache:
+            self.cache.close()
+
+        # Reset state
+        self.caches = []
+        self.file_boundaries = [file.end_page for file in loaded_files[:-1]] if loaded_files else []
+        self.selected_pages = []
+        self.spread_pairs = []
+        self.photo_images = {}
+        self.thumb_labels = {}
+
+        # Clear existing widgets
+        for widget in self.scrollable_frame.winfo_children():
+            widget.destroy()
+
+        # Store caches from loaded files
+        self.caches = [file.cache for file in loaded_files]
+        # Set first cache for backward compatibility
+        if self.caches:
+            self.cache = self.caches[0]
+
+        if not loaded_files:
+            return
+
+        total_pages = loaded_files[-1].end_page
+
+        # Load thumbnails synchronously with proper file tracking
+        def load_and_display():
+            for file in loaded_files:
+                for page_in_file in range(1, file.total_pages + 1):
+                    virtual_page = file.start_page + page_in_file - 1
+
+                    # Load thumbnail from this file's cache
+                    file.cache.load_thumbnail(page_in_file)
+
+                    # Schedule display on main thread with COPIED file reference
+                    # Use a factory function to avoid closure issues
+                    def make_display_callback(vp, f, pp):
+                        return lambda: self._add_thumbnail_multi(vp, f, pp)
+
+                    self.after(0, make_display_callback(virtual_page, file, page_in_file))
+
+                    if progress_callback:
+                        progress_callback(virtual_page, total_pages)
 
         threading.Thread(target=load_and_display, daemon=True).start()
 
@@ -265,6 +329,68 @@ class ThumbnailGrid(ttk.Frame):
 
         # Apply spread highlighting immediately if this page is in a spread pair
         if self._is_page_in_spread(page_num):
+            label.configure(
+                highlightbackground=self.theme.color_spread,
+                highlightthickness=self.theme.highlight_thickness
+            )
+
+    def _add_thumbnail_multi(self, virtual_page: int, file, physical_page: int):
+        """Add thumbnail using virtual page number for multi-file display."""
+        thumb = file.cache.get_thumbnail(physical_page)
+        if thumb is None:
+            return
+
+        # Check if this is the first page of a new file (add separation line)
+        is_file_start = (virtual_page == file.start_page and virtual_page > 1)
+
+        # Calculate grid position
+        row = (virtual_page - 1) // self.columns
+        col = (virtual_page - 1) % self.columns
+
+        # Add separator line before this thumbnail if it's a file boundary at column 0
+        if is_file_start and col == 0:
+            # Full-width separator (spans all columns)
+            sep = ttk.Separator(self.scrollable_frame, orient='horizontal')
+            sep.grid(row=row, column=0, columnspan=self.columns, sticky='ew', pady=5)
+            self._bind_mousewheel_to_widget(sep)  # Bind mousewheel to separator
+            row += 1  # Move thumbnail to next row
+
+        # Create frame for thumbnail + label
+        frame = ttk.Frame(self.scrollable_frame)
+
+        # Add left border for mid-row file boundaries
+        if is_file_start and col != 0:
+            frame.configure(relief='solid', borderwidth=2)
+
+        frame.grid(row=row, column=col, padx=4, pady=4)
+
+        # Convert to PhotoImage
+        photo = ImageTk.PhotoImage(thumb)
+        self.photo_images[virtual_page] = photo  # Use virtual page number
+
+        # Create label (bind using virtual page number)
+        label = tk.Label(frame, image=photo, bd=3, relief="flat", bg='#f0f0f0')
+        label.pack()
+        label.bind("<Button-1>", lambda e, p=virtual_page: self._on_click(p, e))
+        label.bind("<Shift-Button-1>", lambda e, p=virtual_page: self._on_shift_click(p, e))
+        label.bind("<Control-Button-1>", lambda e, p=virtual_page: self._on_ctrl_click(p, e))
+        label.bind("<Enter>", lambda e, p=virtual_page: self._on_hover(p))
+        label.bind("<Button-3>", lambda e, p=virtual_page: self._on_right_click(p, e))
+        label.bind("<Control-Button-3>", lambda e, p=virtual_page: self._on_ctrl_right_click(p, e))
+
+        # Page number label (show virtual page number)
+        num_label = ttk.Label(frame, text=str(virtual_page))
+        num_label.pack()
+
+        # Bind mousewheel to all thumbnail widgets for scrolling
+        self._bind_mousewheel_to_widget(frame)
+        self._bind_mousewheel_to_widget(label)
+        self._bind_mousewheel_to_widget(num_label)
+
+        self.thumb_labels[virtual_page] = label
+
+        # Apply spread highlighting if needed
+        if self._is_page_in_spread(virtual_page):
             label.configure(
                 highlightbackground=self.theme.color_spread,
                 highlightthickness=self.theme.highlight_thickness
@@ -333,6 +459,17 @@ class ThumbnailGrid(ttk.Frame):
             if abs(first_page - second_page) == 1:
                 # Order the pair (lower page first)
                 pair = (min(first_page, second_page), max(first_page, second_page))
+
+                # Check if spread crosses file boundary
+                if self.file_boundaries:
+                    crosses_boundary = any(pair[0] < boundary <= pair[1]
+                                          for boundary in self.file_boundaries)
+                    if crosses_boundary:
+                        messagebox.showwarning(
+                            "Cross-File Spread",
+                            f"Pages {pair[0]} and {pair[1]} are from different files.\n"
+                            "Spreads across file boundaries may not align correctly."
+                        )
 
                 # Check if already marked as spread
                 if pair in self.spread_pairs:
@@ -590,8 +727,10 @@ class PagePreview(ttk.Frame):
 
     def set_cache(self, cache: ThumbnailCache):
         """Set the thumbnail cache to use for rendering pages."""
+        # Don't clear when setting cache - let caller decide
         self.cache = cache
-        self.clear()
+        # Reset current_page since cache changed
+        self.current_page = None
 
     def show_page(self, page_num: int, crops: dict = None):
         """Show a larger preview of the specified page."""
@@ -1266,9 +1405,11 @@ class BookletMakerGUI(tk.Tk):
         self.geometry("1200x800")
         self.minsize(900, 700)
 
-        self.pdf_path = None  # Original file path (PDF or CBZ)
-        self.temp_pdf_path = None  # Temp PDF path if CBZ was converted
+        # Multi-file tracking (replaces single pdf_path/temp_pdf_path)
+        self.loaded_files = []  # List[LoadedFile]
+        self.total_virtual_pages = 0  # Sum of pages across all files
         self._temp_cropped_pdf = None  # Temp PDF path with crops applied
+        self._temp_merged_pdf = None  # Temp merged PDF for generation
         self.current_book_index = 0
         self._updating_from_list = False  # Prevent recursive updates
 
@@ -1307,10 +1448,16 @@ class BookletMakerGUI(tk.Tk):
         top_frame = ttk.Frame(self)
         top_frame.pack(fill='x', padx=10, pady=5)
 
-        self.file_label = ttk.Label(top_frame, text="No PDF loaded")
+        self.file_label = ttk.Label(top_frame, text="No files loaded")
         self.file_label.pack(side='left')
 
-        ttk.Button(top_frame, text="Open", command=self._open_pdf).pack(side='left', padx=10)
+        # Store button reference for Open/Add state management
+        self.open_button = ttk.Button(top_frame, text="Open", command=self._open_pdf)
+        self.open_button.pack(side='left', padx=10)
+
+        # Clear button (disabled initially)
+        self.clear_button = ttk.Button(top_frame, text="Clear", command=self._clear_all, state='disabled')
+        self.clear_button.pack(side='left', padx=5)
 
         # Split double pages button (only if PyMuPDF available)
         if PYMUPDF_AVAILABLE:
@@ -1370,7 +1517,23 @@ class BookletMakerGUI(tk.Tk):
         # Bind mouse wheel for scrolling
         def _on_bottom_mousewheel(event):
             bottom_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-        bottom_canvas.bind_all("<MouseWheel>", _on_bottom_mousewheel)
+
+        def _bind_bottom_mousewheel_recursive(widget):
+            """Recursively bind mousewheel to widget and all its children."""
+            try:
+                widget.bind("<MouseWheel>", _on_bottom_mousewheel, add="+")
+            except:
+                pass  # Skip widgets that don't support binding
+
+            try:
+                for child in widget.winfo_children():
+                    _bind_bottom_mousewheel_recursive(child)
+            except:
+                pass
+
+        bottom_canvas.bind("<MouseWheel>", _on_bottom_mousewheel)
+        # Bind to scrollable frame and all its children (will be called after widgets are created)
+        self._bind_bottom_mousewheel = lambda: _bind_bottom_mousewheel_recursive(bottom_scrollable_frame)
 
         # Bind canvas resize to adjust scrollable frame width
         def _on_bottom_canvas_resize(event):
@@ -1460,139 +1623,213 @@ class BookletMakerGUI(tk.Tk):
         self.output_folder_entry.pack(side='right', padx=5)
         ttk.Label(btn_frame, text="Output Folder:").pack(side='right', padx=(0, 5))
 
+        # Bind mousewheel to all bottom panel widgets after they're all created
+        self._bind_bottom_mousewheel()
+
     def _cleanup_temp_pdf(self):
-        """Clean up temporary PDF file if it exists."""
-        if self.temp_pdf_path and os.path.exists(self.temp_pdf_path):
-            try:
-                os.unlink(self.temp_pdf_path)
-            except OSError:
-                pass  # Ignore cleanup errors
-            self.temp_pdf_path = None
-
-    def _open_pdf(self):
-        """Open a PDF or CBZ file."""
-        path = filedialog.askopenfilename(
-            title="Select PDF or CBZ",
-            filetypes=[("Comic files", "*.pdf *.cbz"), ("PDF files", "*.pdf"), ("CBZ files", "*.cbz"), ("All files", "*.*")]
-        )
-        if path:
-            # Clean up any previous temp file
-            self._cleanup_temp_pdf()
-
-            self.pdf_path = path
-            self.file_label.configure(text=f"{Path(path).name}")
-
-            # Set default output name
-            self.output_name.delete(0, tk.END)
-            self.output_name.insert(0, Path(path).stem + "_book1")
-
-            # Convert CBZ to temp PDF for thumbnail display
-            if Path(path).suffix.lower() == '.cbz':
-                self.file_label.configure(text=f"{Path(path).name} (converting...)")
-                self.update_idletasks()
+        """Clean up all temporary files."""
+        # Clean up loaded file temps (CBZ/image conversions)
+        for file in self.loaded_files:
+            if file.is_temp and os.path.exists(file.display_path):
                 try:
-                    self.temp_pdf_path = cbz_to_pdf(path)
-                    pdf_for_display = self.temp_pdf_path
-                    self.file_label.configure(text=f"{Path(path).name}")
-                except Exception as e:
-                    messagebox.showerror("Error", f"Failed to convert CBZ:\n{e}")
-                    return
-            else:
-                pdf_for_display = path
-
-            # Load thumbnails
-            self.progress['value'] = 0
-
-            def on_progress(current, total):
-                self.progress['value'] = (current / total) * 100
-                self.update_idletasks()
-
-            self.thumbnail_grid.load_pdf(pdf_for_display, on_progress)
-            self.selection_builder.set_total_pages(
-                pdfium.PdfDocument(pdf_for_display).__len__()
-            )
-
-            # Connect the thumbnail cache to the page preview for hover
-            if self.thumbnail_grid.cache:
-                self.page_preview.set_cache(self.thumbnail_grid.cache)
-
-            # Set default output folder only if not already set from config
-            if not self.output_folder_var.get():
-                self.output_folder_var.set(str(Path(path).parent / "prints"))
-
-    def _split_double_pages(self):
-        """Split double-page spreads in the currently loaded file."""
-        if not self.pdf_path:
-            messagebox.showerror("Error", "No file loaded")
-            return
-
-        # Get the PDF to process (use temp PDF if we converted from CBZ)
-        pdf_to_split = self.temp_pdf_path if self.temp_pdf_path else self.pdf_path
-
-        self.file_label.configure(text=f"{Path(self.pdf_path).name} (splitting...)")
-        self.update_idletasks()
-
-        try:
-            # Split the double pages
-            result = split_double_pages(pdf_to_split)
-
-            if result['splits_made'] == 0:
-                self.file_label.configure(text=f"{Path(self.pdf_path).name}")
-                messagebox.showinfo("No Changes", "No double-page spreads detected.")
-                return
-
-            # Clean up old temp file if it's different from the new one
-            old_temp = self.temp_pdf_path
-            self.temp_pdf_path = result['output_path']
-
-            if old_temp and old_temp != result['output_path'] and os.path.exists(old_temp):
-                try:
-                    os.unlink(old_temp)
+                    os.unlink(file.display_path)
                 except OSError:
                     pass
 
-            # Reload thumbnails from the split PDF
-            self.progress['value'] = 0
+        # Clean up merged PDF
+        if hasattr(self, '_temp_merged_pdf') and self._temp_merged_pdf and os.path.exists(self._temp_merged_pdf):
+            try:
+                os.unlink(self._temp_merged_pdf)
+            except OSError:
+                pass
 
-            def on_progress(current, total):
-                self.progress['value'] = (current / total) * 100
-                self.update_idletasks()
+        # Clean up cropped PDF
+        if self._temp_cropped_pdf and os.path.exists(self._temp_cropped_pdf):
+            try:
+                os.unlink(self._temp_cropped_pdf)
+            except OSError:
+                pass
 
-            self.thumbnail_grid.load_pdf(self.temp_pdf_path, on_progress)
-            self.selection_builder.set_total_pages(
-                pdfium.PdfDocument(self.temp_pdf_path).__len__()
-            )
+    def _open_pdf(self):
+        """Load PDF/CBZ/image files with multi-select support."""
+        # Determine dialog behavior based on current state
+        if not self.loaded_files:
+            title = "Select PDF, CBZ, or Image Files"
+        else:
+            title = "Add More Files"
 
-            # Update page preview with new cache
-            if self.thumbnail_grid.cache:
-                self.page_preview.set_cache(self.thumbnail_grid.cache)
+        # File dialog with multi-select
+        paths = filedialog.askopenfilenames(
+            title=title,
+            filetypes=[
+                ("All supported", "*.pdf *.cbz *.jpg *.jpeg *.png *.gif *.bmp *.webp"),
+                ("PDF files", "*.pdf"),
+                ("CBZ files", "*.cbz"),
+                ("Image files", "*.jpg *.jpeg *.png *.gif *.bmp *.webp"),
+                ("All files", "*.*")
+            ]
+        )
 
-            # Clear any existing selection since page numbers changed
-            self.thumbnail_grid.clear_selection()
+        if not paths:
+            return
+
+        # Group consecutive image files together
+        grouped_files = self._group_image_files(list(paths))
+
+        # Process each file/group
+        for file_group in grouped_files:
+            self._add_file_group(file_group)
+
+        # Update button states
+        self._update_button_states()
+
+        # Reload grid with all files
+        self._reload_thumbnail_grid()
+
+        # Set default output name if this is first load
+        if len(self.loaded_files) == len(grouped_files):
+            # This was the first load
+            first_file = self.loaded_files[0]
+            output_name = Path(first_file.original_path).stem + "_book1"
+            self.output_name.delete(0, tk.END)
+            self.output_name.insert(0, output_name)
+
+            # Set default output folder only if not already set from config
+            if not self.output_folder_var.get():
+                folder = Path(first_file.display_path).parent / "prints"
+                self.output_folder_var.set(str(folder))
+
+    def _clear_all(self):
+        """Clear all loaded files and reset to initial state."""
+        # Confirm if files are loaded
+        if self.loaded_files:
+            if not messagebox.askyesno("Clear All", "Clear all loaded files and selections?"):
+                return
+
+        # Close all caches
+        for file in self.loaded_files:
+            file.cache.close()
+
+        # Clean up temp files
+        for file in self.loaded_files:
+            if file.is_temp and os.path.exists(file.display_path):
+                try:
+                    os.unlink(file.display_path)
+                except OSError:
+                    pass
+
+        # Reset state
+        self.loaded_files = []
+        self.total_virtual_pages = 0
+
+        # Clear thumbnail grid
+        self.thumbnail_grid.caches = []
+        self.thumbnail_grid.file_boundaries = []
+        self.thumbnail_grid.selected_pages = []
+        self.thumbnail_grid.spread_pairs = []
+        self.thumbnail_grid.page_crops = {}
+        self.thumbnail_grid.photo_images = {}
+        self.thumbnail_grid.thumb_labels = {}
+
+        # Clear widgets
+        for widget in self.thumbnail_grid.scrollable_frame.winfo_children():
+            widget.destroy()
+
+        # Reset UI
+        self.file_label.configure(text="No files loaded")
+        self.selection_builder.set_total_pages(0)
+        self.selection_builder.set_selection_string("")
+
+        # Update button states
+        self._update_button_states()
+
+        # Clear preview
+        self.page_preview.clear()
+
+    def _split_double_pages(self):
+        """Split double-page spreads in all loaded files."""
+        if not self.loaded_files:
+            messagebox.showerror("Error", "No files loaded")
+            return
+
+        # Confirm with user
+        file_count = len(self.loaded_files)
+        if not messagebox.askyesno("Split All Files",
+            f"This will split double pages in {file_count} file(s).\n"
+            "All selections, crops, and spreads will be cleared.\n"
+            "Continue?"):
+            return
+
+        self.file_label.configure(text="Splitting pages...")
+        self.update_idletasks()
+
+        try:
+            new_loaded_files = []
+            virtual_offset = 0
+
+            for file in self.loaded_files:
+                # Split this file
+                result = split_double_pages(file.display_path)
+
+                # Use split result or original
+                new_path = result['output_path'] if result['splits_made'] > 0 else file.display_path
+
+                # Create new cache
+                new_cache = ThumbnailCache(new_path)
+                new_total = new_cache.total_pages
+
+                # Create new LoadedFile with updated virtual page range
+                new_file = LoadedFile(
+                    original_path=file.original_path,
+                    display_path=new_path,
+                    file_type=file.file_type,
+                    start_page=virtual_offset + 1,
+                    end_page=virtual_offset + new_total,
+                    total_pages=new_total,
+                    cache=new_cache,
+                    is_temp=(result['splits_made'] > 0 or file.is_temp)
+                )
+                new_loaded_files.append(new_file)
+                virtual_offset += new_total
+
+                # Cleanup old temp file if it's different from new path
+                if file.is_temp and file.display_path != new_path:
+                    try:
+                        os.unlink(file.display_path)
+                    except OSError:
+                        pass
+
+            # Close old caches
+            for file in self.loaded_files:
+                file.cache.close()
+
+            # Replace loaded files with new ones
+            self.loaded_files = new_loaded_files
+            self.total_virtual_pages = virtual_offset
+
+            # Clear all selections (too complex to remap)
+            self.thumbnail_grid.selected_pages = []
+            self.thumbnail_grid.spread_pairs = []
+            self.thumbnail_grid.page_crops = {}
             self.selection_builder.set_selection_string("")
 
-            # Auto-mark split pairs as spreads
-            if result.get('split_pairs'):
-                self.thumbnail_grid.spread_pairs = result['split_pairs'].copy()
-                # Highlighting is applied during thumbnail creation in _add_thumbnail()
-                # Just trigger alignment validation
-                self._on_spread_change(result['split_pairs'])
+            # Reload thumbnail grid with new files
+            self._reload_thumbnail_grid()
+            self._update_button_states()
 
-            self.file_label.configure(text=f"{Path(self.pdf_path).name}")
-            messagebox.showinfo(
-                "Split Complete",
-                f"Split {result['splits_made']} double-page spread(s).\n"
-                f"Pages: {result['original_pages']} → {result['output_pages']}\n"
-                f"Automatically marked {len(result.get('split_pairs', []))} spread pair(s)."
-            )
+            messagebox.showinfo("Split Complete",
+                f"Split complete. Total pages: {self.total_virtual_pages}\n"
+                "Selections cleared - please re-select pages.")
 
         except Exception as e:
-            self.file_label.configure(text=f"{Path(self.pdf_path).name}")
+            self._update_button_states()
             messagebox.showerror("Error", f"Failed to split pages:\n{e}")
 
     def _browse_output_folder(self):
         """Open folder selection dialog for output directory."""
-        initial_dir = self.output_folder_var.get() or (Path(self.pdf_path).parent if self.pdf_path else None)
+        initial_dir = self.output_folder_var.get()
+        if not initial_dir and self.loaded_files:
+            initial_dir = Path(self.loaded_files[0].display_path).parent
         folder = filedialog.askdirectory(
             title="Select Output Folder",
             initialdir=initial_dir
@@ -1616,8 +1853,200 @@ class BookletMakerGUI(tk.Tk):
     def _on_close(self):
         """Handle window close - save config, cleanup, and exit."""
         self._save_config()
+
+        # Close all caches
+        for file in self.loaded_files:
+            file.cache.close()
+
+        # Clean up temp files
         self._cleanup_temp_pdf()
+
         self.destroy()
+
+    def _virtual_to_physical(self, virtual_page: int) -> Tuple[any, int]:
+        """
+        Map virtual page number to (file, physical_page).
+
+        Args:
+            virtual_page: 1-indexed virtual page number (1 to total_virtual_pages)
+
+        Returns:
+            (LoadedFile, physical_page) where physical_page is 1-indexed within that file
+
+        Raises:
+            ValueError: If virtual_page is out of range
+        """
+        if virtual_page < 1 or virtual_page > self.total_virtual_pages:
+            raise ValueError(f"Virtual page {virtual_page} out of range (1-{self.total_virtual_pages})")
+
+        for file in self.loaded_files:
+            if file.start_page <= virtual_page <= file.end_page:
+                physical_page = virtual_page - file.start_page + 1
+                return (file, physical_page)
+
+        raise ValueError(f"No file found for virtual page {virtual_page}")
+
+    def _get_file_boundaries(self) -> List[int]:
+        """
+        Get list of virtual page numbers where files end.
+
+        Returns:
+            List of end_page values for drawing separation lines
+            Example: [20, 45, 70] means files end at pages 20, 45, 70
+        """
+        if not self.loaded_files:
+            return []
+        return [file.end_page for file in self.loaded_files[:-1]]  # Exclude last file
+
+    def _update_button_states(self):
+        """Update Open/Add and Clear button states based on loaded files."""
+        if self.loaded_files:
+            # Files loaded - show "Add" and enable "Clear"
+            self.open_button.configure(text="Add")
+            self.clear_button.configure(state='normal')
+
+            # Update file label
+            file_count = len(self.loaded_files)
+            self.file_label.configure(
+                text=f"{file_count} file(s) loaded - {self.total_virtual_pages} pages total"
+            )
+        else:
+            # No files - show "Open" and disable "Clear"
+            self.open_button.configure(text="Open")
+            self.clear_button.configure(state='disabled')
+            self.file_label.configure(text="No files loaded")
+
+    def _group_image_files(self, paths: List[str]) -> List[List[str]]:
+        """
+        Group consecutive image files into single PDF conversions.
+
+        Args:
+            paths: List of file paths to process
+
+        Returns:
+            List of file groups, where each group is either:
+            - [single_pdf_or_cbz_path] for PDF/CBZ
+            - [img1, img2, ...] for consecutive images
+        """
+        from src.config import IMAGE_EXTENSIONS
+
+        groups = []
+        current_image_group = []
+
+        for path in paths:
+            ext = Path(path).suffix.lower()
+
+            if ext in IMAGE_EXTENSIONS:
+                # Add to current image group
+                current_image_group.append(path)
+            else:
+                # PDF or CBZ - flush image group first
+                if current_image_group:
+                    groups.append(current_image_group)
+                    current_image_group = []
+                groups.append([path])
+
+        # Flush remaining images
+        if current_image_group:
+            groups.append(current_image_group)
+
+        return groups
+
+    def _add_file_group(self, file_paths: List[str]):
+        """
+        Add a single file or group of images as a LoadedFile.
+
+        Args:
+            file_paths: Single file path or list of image paths to convert
+        """
+        from src.config import IMAGE_EXTENSIONS
+
+        first_path = Path(file_paths[0])
+        ext = first_path.suffix.lower()
+
+        # Determine file type and conversion needs
+        if len(file_paths) > 1 or ext in IMAGE_EXTENSIONS:
+            # Multiple images - convert to PDF
+            try:
+                temp_pdf = images_to_pdf([str(p) for p in file_paths])
+                display_path = temp_pdf
+                original_path = ", ".join([Path(p).name for p in file_paths[:3]])
+                if len(file_paths) > 3:
+                    original_path += f" + {len(file_paths) - 3} more"
+                file_type = 'image'
+                is_temp = True
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to convert images:\n{e}")
+                return
+
+        elif ext == '.cbz':
+            # CBZ - convert to PDF
+            try:
+                temp_pdf = cbz_to_pdf(str(first_path))
+                display_path = temp_pdf
+                original_path = str(first_path)
+                file_type = 'cbz'
+                is_temp = True
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to convert CBZ:\n{e}")
+                return
+
+        else:
+            # PDF - use directly
+            display_path = str(first_path)
+            original_path = str(first_path)
+            file_type = 'pdf'
+            is_temp = False
+
+        # Create cache and determine page count
+        try:
+            cache = ThumbnailCache(display_path)
+            total_pages = cache.total_pages
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to load PDF:\n{e}")
+            return
+
+        # Calculate virtual page range
+        start_page = self.total_virtual_pages + 1
+        end_page = self.total_virtual_pages + total_pages
+
+        # Create LoadedFile entry
+        loaded_file = LoadedFile(
+            original_path=original_path,
+            display_path=display_path,
+            file_type=file_type,
+            start_page=start_page,
+            end_page=end_page,
+            total_pages=total_pages,
+            cache=cache,
+            is_temp=is_temp
+        )
+
+        self.loaded_files.append(loaded_file)
+        self.total_virtual_pages = end_page
+
+    def _reload_thumbnail_grid(self):
+        """Refresh grid with all loaded files."""
+        if not self.loaded_files:
+            return
+
+        self.progress['value'] = 0
+
+        def on_progress(current, total):
+            self.progress['value'] = (current / total) * 100
+            self.update_idletasks()
+
+        # Call load_pdfs with all loaded files
+        self.thumbnail_grid.load_pdfs(self.loaded_files, on_progress)
+
+        # Update selection builder with new total
+        self.selection_builder.set_total_pages(self.total_virtual_pages)
+
+        # Connect the thumbnail caches to the page preview
+        if self.loaded_files:
+            # For now, use the first file's cache for backwards compatibility
+            # Later we'll update PagePreview to handle multi-file
+            self.page_preview.set_cache(self.loaded_files[0].cache)
 
     def _on_selection_change(self, pages: List[int]):
         """Handle selection change from thumbnail grid."""
@@ -1675,18 +2104,71 @@ class BookletMakerGUI(tk.Tk):
             books[self.current_book_index]['selection'] = selection
             self.book_list.update_book(self.current_book_index, books[self.current_book_index])
 
-    def _on_page_hover(self, page_num: int):
+    def _on_page_hover(self, virtual_page: int):
         """Handle hover over a page thumbnail."""
-        crops = self.thumbnail_grid.page_crops.get(page_num)
-        self.page_preview.show_page(page_num, crops)
+        if not self.loaded_files:
+            return
+
+        try:
+            # Map virtual page to file and physical page
+            file, physical_page = self._virtual_to_physical(virtual_page)
+
+            # Switch cache if needed (doesn't clear preview)
+            if self.page_preview.cache != file.cache:
+                self.page_preview.set_cache(file.cache)
+
+            # Get crops for this virtual page
+            crops = self.thumbnail_grid.page_crops.get(virtual_page)
+
+            # Show the physical page from the correct file
+            self.page_preview.show_page(physical_page, crops)
+
+            # Update header to show virtual page number (override show_page's header)
+            total = self.total_virtual_pages
+            self.page_preview.header.configure(text=f"Page {virtual_page} of {total}")
+
+        except Exception as e:
+            # Log errors instead of silent swallow
+            print(f"Preview error for page {virtual_page}: {e}")
+            import traceback
+            traceback.print_exc()
 
     def _update_preview(self):
         """Legacy method - no longer used since we replaced booklet layout with page preview."""
         pass
 
+    def _merge_loaded_files(self) -> str:
+        """
+        Merge all loaded files into a single temporary PDF for generation.
+
+        Returns:
+            Path to merged temporary PDF
+        """
+        from pypdf import PdfWriter, PdfReader
+        import tempfile
+
+        # Create temp file for merged PDF
+        temp_fd, temp_path = tempfile.mkstemp(suffix='.pdf', prefix='merged_')
+        os.close(temp_fd)
+        self._temp_merged_pdf = temp_path
+
+        writer = PdfWriter()
+
+        # Append pages from each file
+        for file in self.loaded_files:
+            reader = PdfReader(file.display_path)
+            for page_num in range(len(reader.pages)):
+                writer.add_page(reader.pages[page_num])
+
+        # Write merged PDF
+        with open(temp_path, 'wb') as f:
+            writer.write(f)
+
+        return temp_path
+
     def _generate(self):
         """Generate all booklets."""
-        if not self.pdf_path:
+        if not self.loaded_files:
             messagebox.showerror("Error", "No PDF loaded")
             return
 
@@ -1702,14 +2184,14 @@ class BookletMakerGUI(tk.Tk):
             return
 
         # Get options
-        output_name = self.output_name.get() or Path(self.pdf_path).stem
+        output_name = self.output_name.get() or "booklet"
         # Remove _bookN suffix for folder name
         if '_book' in output_name:
             output_name = output_name.rsplit('_book', 1)[0]
 
         try:
-            # Determine input PDF (use temp_pdf_path if CBZ was converted)
-            input_pdf = self.temp_pdf_path if self.temp_pdf_path else self.pdf_path
+            # Merge all loaded files into single temp PDF
+            merged_pdf_path = self._merge_loaded_files()
 
             # Get crop data from thumbnail grid
             page_crops_dict = self.thumbnail_grid.get_page_crops()
@@ -1728,7 +2210,7 @@ class BookletMakerGUI(tk.Tk):
 
                     crop_service = CropService()
                     cropped_pdf_path = crop_service.apply_crops_to_pdf(
-                        pdf_path=Path(input_pdf),
+                        pdf_path=Path(merged_pdf_path),
                         crops=crops
                     )
 
@@ -1740,7 +2222,7 @@ class BookletMakerGUI(tk.Tk):
                     messagebox.showerror("Error", f"Failed to apply crops:\n{e}")
                     return
             else:
-                input_for_booklet = input_pdf
+                input_for_booklet = merged_pdf_path
 
             # Convert display label back to paper size key
             paper_size_key = self.paper_size_keys.get(self.paper_size.get(), DEFAULT_PAPER_SIZE)
@@ -1767,6 +2249,14 @@ class BookletMakerGUI(tk.Tk):
             messagebox.showerror("Error", f"Generation failed:\n{e}")
 
         finally:
+            # Cleanup temp merged PDF
+            if self._temp_merged_pdf and os.path.exists(self._temp_merged_pdf):
+                try:
+                    os.unlink(self._temp_merged_pdf)
+                    self._temp_merged_pdf = None
+                except:
+                    pass  # Best effort cleanup
+
             # Cleanup temp cropped PDF
             if self._temp_cropped_pdf and os.path.exists(self._temp_cropped_pdf):
                 try:

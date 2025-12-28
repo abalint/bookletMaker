@@ -116,6 +116,61 @@ def cbz_to_pdf(cbz_path: str) -> str:
     return temp_pdf_path
 
 
+def images_to_pdf(image_paths: List[str]) -> str:
+    """
+    Convert multiple image files to a temporary PDF.
+
+    Args:
+        image_paths: List of paths to image files
+
+    Returns:
+        Path to the temporary PDF file
+
+    Raises:
+        ValueError: If no valid images found
+    """
+    if not image_paths:
+        raise ValueError("No image paths provided")
+
+    # Create temporary PDF file
+    temp_pdf = tempfile.NamedTemporaryFile(suffix='.pdf', delete=False)
+    temp_pdf_path = temp_pdf.name
+    temp_pdf.close()
+
+    # Load and convert images
+    pdf_images = []
+    for img_path in image_paths:
+        try:
+            img = Image.open(img_path)
+            # Convert to RGB if necessary (for PNG with transparency, etc.)
+            if img.mode in ('RGBA', 'P', 'LA'):
+                # Create white background for transparent images
+                background = Image.new('RGB', img.size, (255, 255, 255))
+                if img.mode == 'P':
+                    img = img.convert('RGBA')
+                background.paste(img, mask=img.split()[-1] if img.mode in ('RGBA', 'LA') else None)
+                img = background
+            elif img.mode != 'RGB':
+                img = img.convert('RGB')
+            pdf_images.append(img.copy())
+        except Exception as e:
+            print(f"Warning: Failed to load image {img_path}: {e}")
+
+    if not pdf_images:
+        raise ValueError("No valid images found")
+
+    # Save all images as a PDF
+    pdf_images[0].save(
+        temp_pdf_path,
+        'PDF',
+        save_all=True,
+        append_images=pdf_images[1:] if len(pdf_images) > 1 else []
+    )
+
+    print(f"Converted {len(pdf_images)} image(s) to temporary PDF")
+    return temp_pdf_path
+
+
 def split_double_pages(input_path: str, output_path: str = None) -> dict:
     """
     Split double-page spreads in a PDF into separate pages.

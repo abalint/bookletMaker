@@ -225,3 +225,40 @@ class CropDefaults:
             left=data.get('left', 0.0),
             right=data.get('right', 0.0)
         )
+
+
+@dataclass
+class LoadedFile:
+    """
+    Represents a loaded file in multi-file mode.
+
+    Tracks a single PDF/CBZ/image file with its virtual page range
+    and dedicated thumbnail cache.
+    """
+    original_path: str          # Original file path (PDF/CBZ/images)
+    display_path: str           # Path to PDF for display (may be temp)
+    file_type: str              # 'pdf', 'cbz', or 'image'
+    start_page: int             # Virtual page number where this file starts
+    end_page: int               # Virtual page number where this file ends
+    total_pages: int            # Number of pages in this file
+    cache: 'ThumbnailCache'     # Dedicated cache for this file (forward ref)
+    is_temp: bool = False       # True if display_path is temporary
+
+    def __post_init__(self):
+        """Validate loaded file."""
+        if self.total_pages < 1:
+            raise ValueError("total_pages must be >= 1")
+        if self.start_page < 1:
+            raise ValueError("start_page must be >= 1")
+        if self.end_page < self.start_page:
+            raise ValueError("end_page must be >= start_page")
+        if (self.end_page - self.start_page + 1) != self.total_pages:
+            raise ValueError(
+                f"Page range mismatch: {self.end_page} - {self.start_page} + 1 "
+                f"!= {self.total_pages}"
+            )
+        if self.file_type not in ('pdf', 'cbz', 'image'):
+            raise ValueError(
+                f"Invalid file_type: {self.file_type} "
+                f"(must be 'pdf', 'cbz', or 'image')"
+            )
