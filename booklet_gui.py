@@ -255,6 +255,7 @@ class ThumbnailGrid(ttk.Frame):
         label.bind("<Control-Button-1>", lambda e, p=page_num: self._on_ctrl_click(p, e))
         label.bind("<Enter>", lambda e, p=page_num: self._on_hover(p))
         label.bind("<Button-3>", lambda e, p=page_num: self._on_right_click(p, e))  # Right-click menu
+        label.bind("<Control-Button-3>", lambda e, p=page_num: self._on_ctrl_right_click(p, e))  # Quick apply default trim
 
         # Page number label
         num_label = ttk.Label(frame, text=str(page_num))
@@ -371,6 +372,17 @@ class ThumbnailGrid(ttk.Frame):
         finally:
             menu.grab_release()
 
+    def _on_ctrl_right_click(self, page_num: int, event):
+        """Toggle crop on Ctrl+Right-click."""
+        if page_num in self.page_crops:
+            # Page is cropped - reset to original
+            self._apply_crop(page_num, {'top': 0, 'bottom': 0, 'left': 0, 'right': 0}, False)
+        else:
+            # Page not cropped - apply default if one exists
+            has_default = any(self.default_crop.get(k, 0) > 0 for k in ['top', 'bottom', 'left', 'right'])
+            if has_default:
+                self._apply_crop(page_num, self.default_crop.copy(), False)
+
     def _show_crop_dialog(self, page_num: int):
         """Open crop dialog for page."""
         if self.cache is None:
@@ -415,8 +427,11 @@ class ThumbnailGrid(ttk.Frame):
             self._restore_original_thumbnail(page_num)
 
             if page_num in self.thumb_labels:
-                # Reset to default appearance
-                self._update_selection_display()
+                # Reset border for this thumbnail only
+                self.thumb_labels[page_num].configure(
+                    highlightbackground='#f0f0f0',
+                    highlightthickness=0
+                )
 
     def get_page_crops(self) -> dict:
         """Get dictionary of page crops for booklet generation."""
@@ -578,7 +593,7 @@ class PagePreview(ttk.Frame):
         self.cache = cache
         self.clear()
 
-    def show_page(self, page_num: int):
+    def show_page(self, page_num: int, crops: dict = None):
         """Show a larger preview of the specified page."""
         if not self.cache or page_num == self.current_page:
             return
@@ -602,6 +617,18 @@ class PagePreview(ttk.Frame):
 
             bitmap = page.render(scale=scale)
             pil_image = bitmap.to_pil()
+
+            # Apply crop if present
+            if crops and any(crops.get(k, 0) > 0 for k in ['top', 'bottom', 'left', 'right']):
+                from src.services.crop_service import CropService
+                crop_service = CropService()
+                pil_image = crop_service.crop_image(
+                    pil_image,
+                    crop_top_percent=crops.get('top', 0),
+                    crop_bottom_percent=crops.get('bottom', 0),
+                    crop_left_percent=crops.get('left', 0),
+                    crop_right_percent=crops.get('right', 0)
+                )
 
             # Center the image in the preview area
             result = Image.new('RGB', PREVIEW_SIZE, '#f0f0f0')
@@ -1619,7 +1646,8 @@ class BookletMakerGUI(tk.Tk):
 
     def _on_page_hover(self, page_num: int):
         """Handle hover over a page thumbnail."""
-        self.page_preview.show_page(page_num)
+        crops = self.thumbnail_grid.page_crops.get(page_num)
+        self.page_preview.show_page(page_num, crops)
 
     def _update_preview(self):
         """Legacy method - no longer used since we replaced booklet layout with page preview."""
