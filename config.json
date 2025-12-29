@@ -1,12 +1,12 @@
 {
   "reading_order": "western",
-  "signatures": 0,
+  "signatures": 1,
   "duplex_mode": "auto",
   "paper_size": "tabloid",
-  "output_folder": "I:/comics/marvel/Annihilation_ Prologue/New folder",
+  "output_folder": "I:\\comics\\marvel\\Annihilation\\prints",
   "default_crop": {
     "top": 0.0,
-    "bottom": 3.485838779956427,
+    "bottom": 3.9215686274509802,
     "left": 0.0,
     "right": 0.0
   }

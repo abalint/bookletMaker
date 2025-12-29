@@ -1769,6 +1769,8 @@ class BookletMakerGUI(tk.Tk):
         try:
             new_loaded_files = []
             virtual_offset = 0
+            all_virtual_split_pairs = []  # Track split pairs with virtual page numbers
+            total_splits = 0  # Track total number of splits
 
             for file in self.loaded_files:
                 # Split this file
@@ -1776,6 +1778,15 @@ class BookletMakerGUI(tk.Tk):
 
                 # Use split result or original
                 new_path = result['output_path'] if result['splits_made'] > 0 else file.display_path
+
+                # Collect and adjust split_pairs for virtual page numbering
+                if result.get('split_pairs'):
+                    total_splits += len(result['split_pairs'])
+                    for p1, p2 in result['split_pairs']:
+                        # Adjust from file-local to virtual page numbers
+                        virtual_p1 = p1 + virtual_offset
+                        virtual_p2 = p2 + virtual_offset
+                        all_virtual_split_pairs.append((virtual_p1, virtual_p2))
 
                 # Create new cache
                 new_cache = ThumbnailCache(new_path)
@@ -1812,16 +1823,23 @@ class BookletMakerGUI(tk.Tk):
 
             # Clear all selections (too complex to remap)
             self.thumbnail_grid.selected_pages = []
-            self.thumbnail_grid.spread_pairs = []
             self.thumbnail_grid.page_crops = {}
             self.selection_builder.set_selection_string("")
+            # NOTE: Don't clear spread_pairs here - we'll set them after reload
 
             # Reload thumbnail grid with new files
             self._reload_thumbnail_grid()
+
+            # CRITICAL: Set spread_pairs AFTER reload (load_pdfs clears them)
+            # Then apply highlighting to already-loaded thumbnails
+            self.thumbnail_grid.spread_pairs = all_virtual_split_pairs
+            self.thumbnail_grid._update_selection_display()
+
             self._update_button_states()
 
             messagebox.showinfo("Split Complete",
                 f"Split complete. Total pages: {self.total_virtual_pages}\n"
+                f"Auto-marked {total_splits} spread pair(s).\n"
                 "Selections cleared - please re-select pages.")
 
         except Exception as e:
