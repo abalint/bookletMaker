@@ -42,6 +42,10 @@ COLOR_CROP = '#9C27B0'          # Purple - cropped pages (watermark removal)
 MAX_CROP_PERCENT = 30           # Maximum crop percentage allowed
 CROP_PREVIEW_SIZE = (200, 300)  # Crop dialog preview size (width x height in pixels)
 
+# Cover tag colors
+COLOR_FRONT_COVER = '#2196F3'   # Blue - front cover
+COLOR_BACK_COVER = '#009688'    # Teal - back cover
+
 
 @dataclass
 class UITheme:
@@ -56,11 +60,14 @@ class UITheme:
     color_pending: str = COLOR_PENDING
     color_warning: str = COLOR_WARNING
     color_crop: str = COLOR_CROP
+    color_front_cover: str = COLOR_FRONT_COVER
+    color_back_cover: str = COLOR_BACK_COVER
     highlight_thickness: int = 3
 
     def __post_init__(self):
         """Validate color codes."""
-        for color_name in ['color_selected', 'color_spread', 'color_pending', 'color_warning', 'color_crop']:
+        for color_name in ['color_selected', 'color_spread', 'color_pending', 'color_warning',
+                           'color_crop', 'color_front_cover', 'color_back_cover']:
             color_value = getattr(self, color_name)
             if not (color_value.startswith('#') and len(color_value) == 7):
                 raise ValueError(f"{color_name} must be a valid hex color code (e.g., #RRGGBB)")
