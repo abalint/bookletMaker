@@ -42,7 +42,7 @@ from src.config import UITheme, THUMBNAIL_SIZE, PREVIEW_SIZE, GRID_COLUMNS
 
 # Import validators for business logic
 from src.validators import SpreadValidator
-from src.models import SpreadPair
+from src.models import SpreadPair, StretchMode
 
 import json
 
@@ -53,7 +53,7 @@ DEFAULT_CONFIG = {
     "duplex_mode": "auto",
     "paper_size": DEFAULT_PAPER_SIZE,
     "output_folder": "",
-    "default_crop": {"top": 0.0, "bottom": 0.0, "left": 0.0, "right": 0.0}
+    "default_crop": {"top": 0.0, "bottom": 0.0, "left": 0.0, "right": 0.0, "stretch": "none"}
 }
 
 def get_config_path() -> Path:
@@ -78,11 +78,16 @@ def load_config() -> dict:
                         'top': 0.0,
                         'bottom': old_value,
                         'left': 0.0,
-                        'right': 0.0
+                        'right': 0.0,
+                        'stretch': 'none'
                     }
                 elif 'default_crop_percent' in config:
                     # Remove old key if new format is present
                     config.pop('default_crop_percent', None)
+
+                # Migration: Add stretch key to existing default_crop if missing
+                if 'default_crop' in config and 'stretch' not in config['default_crop']:
+                    config['default_crop']['stretch'] = 'none'
 
                 return config
         except (json.JSONDecodeError, IOError):
@@ -148,6 +153,33 @@ class ThumbnailCache:
             if callback:
                 callback(i)
 
+    def merge_with(self, other_pdf_path: str) -> str:
+        """
+        Merge another PDF with the current one.
+
+        Returns path to a new temp file containing the merged PDF.
+        The caller is responsible for cleanup.
+        """
+        import fitz
+        import tempfile
+
+        # Create merged document using PyMuPDF
+        merged_doc = fitz.open(self.pdf_path)
+        other_doc = fitz.open(other_pdf_path)
+
+        # Insert all pages from other document
+        merged_doc.insert_pdf(other_doc)
+
+        other_doc.close()
+
+        # Save to temp file
+        fd, temp_path = tempfile.mkstemp(suffix='.pdf', prefix='merged_')
+        os.close(fd)
+        merged_doc.save(temp_path)
+        merged_doc.close()
+
+        return temp_path
+
     def close(self):
         """Close the PDF document."""
         self.pdf.close()
@@ -175,6 +207,9 @@ class ThumbnailGrid(ttk.Frame):
         # Crop tracking - now supports 4-sided crops
         self.page_crops = {}  # {page_num: {'top': x, 'bottom': y, 'left': z, 'right': w}}
         self.default_crop = default_crop or {'top': 0.0, 'bottom': 0.0, 'left': 0.0, 'right': 0.0}
+
+        # Cover tag tracking
+        self.cover_tags = {'front': None, 'back': None}  # Page numbers or None
 
         # Create scrollable canvas
         self.canvas = tk.Canvas(self, bg='#f0f0f0')
@@ -231,6 +266,77 @@ class ThumbnailGrid(ttk.Frame):
 
         threading.Thread(target=load_and_display, daemon=True).start()
 
+    def merge_pdf(self, pdf_path: str, progress_callback=None) -> str:
+        """
+        Merge a new PDF with the existing one, preserving all state.
+
+        This method:
+        - Merges the new PDF with the current one
+        - Preserves existing thumbnails, spread_pairs, page_crops, selected_pages
+        - Adds new thumbnails for the additional pages
+        - Returns the merged temp file path for cleanup tracking
+        """
+        if self.cache is None:
+            # No existing PDF, just do a normal load
+            self.load_pdf(pdf_path, progress_callback)
+            return None
+
+        # Remember the current page count before merge
+        existing_page_count = self.cache.total_pages
+
+        # Create merged temp PDF
+        merged_path = self.cache.merge_with(pdf_path)
+
+        # Store current state (will be preserved - no adjustment needed for existing page numbers)
+        saved_spread_pairs = self.spread_pairs.copy()
+        saved_page_crops = self.page_crops.copy()
+        saved_selected_pages = self.selected_pages.copy()
+        saved_default_crop = self.default_crop.copy()
+
+        # Close old cache
+        self.cache.close()
+
+        # Create new cache with merged PDF
+        self.cache = ThumbnailCache(merged_path)
+
+        # Restore state (existing page numbers stay the same)
+        self.spread_pairs = saved_spread_pairs
+        self.page_crops = saved_page_crops
+        self.selected_pages = saved_selected_pages
+        self.default_crop = saved_default_crop
+
+        # Reload cached thumbnails for existing pages (they're from old PDF file)
+        for i in range(1, existing_page_count + 1):
+            self.cache.load_thumbnail(i)
+
+        # Update existing thumbnail images to use new cache
+        for page_num in range(1, existing_page_count + 1):
+            if page_num in self.thumb_labels:
+                thumb = self.cache.get_thumbnail(page_num)
+                if thumb:
+                    # Check if page has crops applied
+                    if page_num in self.page_crops:
+                        # Re-apply crop visualization
+                        self._update_thumbnail_with_crop(page_num, self.page_crops[page_num])
+                    else:
+                        photo = ImageTk.PhotoImage(thumb)
+                        self.photo_images[page_num] = photo
+                        self.thumb_labels[page_num].configure(image=photo)
+
+        # Load and add only the NEW thumbnails
+        def load_and_display_new():
+            new_page_count = self.cache.total_pages - existing_page_count
+            for i in range(existing_page_count + 1, self.cache.total_pages + 1):
+                self.cache.load_thumbnail(i)
+                self.after(0, lambda p=i: self._add_thumbnail(p))
+                if progress_callback:
+                    progress_callback(i - existing_page_count, new_page_count)
+
+        threading.Thread(target=load_and_display_new, daemon=True).start()
+
+        # Return the merged temp path so caller can track it for cleanup
+        return merged_path
+
     def _add_thumbnail(self, page_num: int):
         """Add a single thumbnail to the grid."""
         thumb = self.cache.get_thumbnail(page_num)
@@ -263,10 +369,22 @@ class ThumbnailGrid(ttk.Frame):
 
         self.thumb_labels[page_num] = label
 
-        # Apply spread highlighting immediately if this page is in a spread pair
+        # Apply highlighting based on state priority: spread (yellow) > crop (purple) > selection (green)
         if self._is_page_in_spread(page_num):
             label.configure(
                 highlightbackground=self.theme.color_spread,
+                highlightthickness=self.theme.highlight_thickness
+            )
+        elif page_num in self.page_crops:
+            # Page has crop data - show crop highlighting and apply crop visual to thumbnail
+            self._update_thumbnail_with_crop(page_num, self.page_crops[page_num])
+            label.configure(
+                highlightbackground=self.theme.color_crop,
+                highlightthickness=self.theme.highlight_thickness
+            )
+        elif page_num in self.selected_pages:
+            label.configure(
+                highlightbackground=self.theme.color_selected,
                 highlightthickness=self.theme.highlight_thickness
             )
 
@@ -367,6 +485,33 @@ class ThumbnailGrid(ttk.Frame):
             label="Trim...",
             command=lambda: self._show_crop_dialog(page_num)
         )
+
+        menu.add_separator()
+
+        # Front cover option
+        if self.cover_tags.get('front') == page_num:
+            menu.add_command(
+                label="Remove Front Cover Tag",
+                command=lambda: self.clear_cover_tag('front')
+            )
+        else:
+            menu.add_command(
+                label="Tag as Front Cover",
+                command=lambda: self.set_cover_tag('front', page_num)
+            )
+
+        # Back cover option
+        if self.cover_tags.get('back') == page_num:
+            menu.add_command(
+                label="Remove Back Cover Tag",
+                command=lambda: self.clear_cover_tag('back')
+            )
+        else:
+            menu.add_command(
+                label="Tag as Back Cover",
+                command=lambda: self.set_cover_tag('back', page_num)
+            )
+
         try:
             menu.tk_popup(event.x_root, event.y_root)
         finally:
@@ -438,7 +583,7 @@ class ThumbnailGrid(ttk.Frame):
         return self.page_crops.copy()
 
     def _update_thumbnail_with_crop(self, page_num: int, crops: dict):
-        """Update thumbnail to show cropped version."""
+        """Update thumbnail to show cropped and stretched version."""
         if self.cache is None or page_num not in self.thumb_labels:
             return
 
@@ -447,19 +592,29 @@ class ThumbnailGrid(ttk.Frame):
         if thumb is None:
             return
 
-        # Apply crop using CropService
+        # Apply crop and stretch using CropService
         from src.services.crop_service import CropService
         crop_service = CropService()
-        cropped_thumb = crop_service.crop_image(
+
+        # Get stretch mode
+        stretch_str = crops.get('stretch', 'none')
+        try:
+            stretch_mode = StretchMode(stretch_str)
+        except ValueError:
+            stretch_mode = StretchMode.NONE
+
+        # Apply crop and stretch
+        result_thumb = crop_service.crop_and_stretch_image(
             thumb,
             crop_top_percent=crops.get('top', 0),
             crop_bottom_percent=crops.get('bottom', 0),
             crop_left_percent=crops.get('left', 0),
-            crop_right_percent=crops.get('right', 0)
+            crop_right_percent=crops.get('right', 0),
+            stretch_mode=stretch_mode
         )
 
         # Convert to PhotoImage and update label
-        photo = ImageTk.PhotoImage(cropped_thumb)
+        photo = ImageTk.PhotoImage(result_thumb)
         self.photo_images[page_num] = photo  # Keep reference
         self.thumb_labels[page_num].configure(image=photo)
 
@@ -492,7 +647,19 @@ class ThumbnailGrid(ttk.Frame):
             spread_pages.add(p2)
 
         for page_num, label in self.thumb_labels.items():
-            if page_num == self.pending_spread_page:
+            if page_num == self.cover_tags.get('front'):
+                # Front cover - blue (highest priority)
+                label.configure(
+                    highlightbackground=self.theme.color_front_cover,
+                    highlightthickness=self.theme.highlight_thickness
+                )
+            elif page_num == self.cover_tags.get('back'):
+                # Back cover - teal
+                label.configure(
+                    highlightbackground=self.theme.color_back_cover,
+                    highlightthickness=self.theme.highlight_thickness
+                )
+            elif page_num == self.pending_spread_page:
                 # Pending spread page - orange to indicate waiting for second page
                 label.configure(
                     highlightbackground=self.theme.color_pending,
@@ -502,6 +669,12 @@ class ThumbnailGrid(ttk.Frame):
                 # Spread pair - yellow
                 label.configure(
                     highlightbackground=self.theme.color_spread,
+                    highlightthickness=self.theme.highlight_thickness
+                )
+            elif page_num in self.page_crops:
+                # Cropped page - purple
+                label.configure(
+                    highlightbackground=self.theme.color_crop,
                     highlightthickness=self.theme.highlight_thickness
                 )
             elif page_num in counts:
@@ -526,9 +699,45 @@ class ThumbnailGrid(ttk.Frame):
         if self.on_selection_change:
             self.on_selection_change(self.selected_pages)
 
+    def clear_all(self):
+        """Clear all state and thumbnails - use for starting fresh."""
+        if self.cache:
+            self.cache.close()
+            self.cache = None
+
+        self.selected_pages = []
+        self.spread_pairs = []
+        self.pending_spread_page = None
+        self.page_crops = {}
+        self.photo_images = {}
+        self.thumb_labels = {}
+
+        # Clear existing widgets
+        for widget in self.scrollable_frame.winfo_children():
+            widget.destroy()
+
+        if self.on_selection_change:
+            self.on_selection_change(self.selected_pages)
+        if self.on_spread_change:
+            self.on_spread_change(self.spread_pairs)
+
     def get_spread_pairs(self) -> List[Tuple[int, int]]:
         """Get the list of marked spread pairs."""
         return self.spread_pairs.copy()
+
+    def set_cover_tag(self, tag_type: str, page_num: int):
+        """Set front or back cover tag."""
+        self.cover_tags[tag_type] = page_num
+        self._update_selection_display()
+
+    def clear_cover_tag(self, tag_type: str):
+        """Clear front or back cover tag."""
+        self.cover_tags[tag_type] = None
+        self._update_selection_display()
+
+    def get_cover_tags(self) -> dict:
+        """Return current cover tags."""
+        return self.cover_tags.copy()
 
     def check_spread_alignment(self, pages: List) -> List[Tuple[Tuple[int, int], int, int]]:
         """
@@ -568,19 +777,23 @@ class PagePreview(ttk.Frame):
 
         self.cache: Optional[ThumbnailCache] = None
         self.current_page = None
+        self.current_crops = None  # Store crops for re-render on resize
         self.photo_image = None  # Keep reference to prevent GC
 
         # Header label showing page number
         self.header = ttk.Label(self, text="Hover over a page", font=('TkDefaultFont', 10, 'bold'))
         self.header.pack(pady=(0, 10))
 
-        # Canvas to display the page image
-        self.canvas = tk.Canvas(self, width=PREVIEW_SIZE[0], height=PREVIEW_SIZE[1], bg='#f0f0f0')
+        # Canvas to display the page image - no fixed size, fills available space
+        self.canvas = tk.Canvas(self, bg='#f0f0f0')
         self.canvas.pack(fill='both', expand=True)
 
-        # Create placeholder text
+        # Bind resize event
+        self.canvas.bind('<Configure>', self._on_resize)
+
+        # Create placeholder text (will be centered on first resize)
         self.placeholder_text = self.canvas.create_text(
-            PREVIEW_SIZE[0] // 2, PREVIEW_SIZE[1] // 2,
+            0, 0,
             text="Hover over a page\nto preview",
             font=('TkDefaultFont', 12),
             fill='#888888',
@@ -593,6 +806,31 @@ class PagePreview(ttk.Frame):
         self.cache = cache
         self.clear()
 
+    def _get_canvas_size(self):
+        """Get actual canvas dimensions, with fallback to PREVIEW_SIZE."""
+        width = self.canvas.winfo_width()
+        height = self.canvas.winfo_height()
+        # Use fallback if canvas hasn't been mapped yet
+        if width <= 1 or height <= 1:
+            return PREVIEW_SIZE
+        return (width, height)
+
+    def _on_resize(self, event):
+        """Handle canvas resize - re-center placeholder and re-render current page."""
+        canvas_width = event.width
+        canvas_height = event.height
+
+        # Re-center placeholder text
+        self.canvas.coords(self.placeholder_text, canvas_width // 2, canvas_height // 2)
+
+        # Re-render current page if one is displayed
+        if self.current_page is not None and self.cache is not None:
+            # Force re-render by temporarily clearing current_page
+            page_num = self.current_page
+            crops = self.current_crops
+            self.current_page = None
+            self.show_page(page_num, crops)
+
     def show_page(self, page_num: int, crops: dict = None):
         """Show a larger preview of the specified page."""
         if not self.cache or page_num == self.current_page:
@@ -602,7 +840,11 @@ class PagePreview(ttk.Frame):
             return
 
         self.current_page = page_num
+        self.current_crops = crops  # Store for re-render on resize
         self.header.configure(text=f"Page {page_num} of {self.cache.total_pages}")
+
+        # Get actual canvas size
+        canvas_size = self._get_canvas_size()
 
         # Render page at larger size
         try:
@@ -610,30 +852,39 @@ class PagePreview(ttk.Frame):
             page_width = page.get_width()
             page_height = page.get_height()
 
-            # Calculate scale to fit preview size while maintaining aspect ratio
-            scale_w = PREVIEW_SIZE[0] / page_width
-            scale_h = PREVIEW_SIZE[1] / page_height
+            # Calculate scale to fit canvas size while maintaining aspect ratio
+            scale_w = canvas_size[0] / page_width
+            scale_h = canvas_size[1] / page_height
             scale = min(scale_w, scale_h)
 
             bitmap = page.render(scale=scale)
             pil_image = bitmap.to_pil()
 
-            # Apply crop if present
+            # Apply crop and stretch if present
             if crops and any(crops.get(k, 0) > 0 for k in ['top', 'bottom', 'left', 'right']):
                 from src.services.crop_service import CropService
                 crop_service = CropService()
-                pil_image = crop_service.crop_image(
+
+                # Get stretch mode
+                stretch_str = crops.get('stretch', 'none')
+                try:
+                    stretch_mode = StretchMode(stretch_str)
+                except ValueError:
+                    stretch_mode = StretchMode.NONE
+
+                pil_image = crop_service.crop_and_stretch_image(
                     pil_image,
                     crop_top_percent=crops.get('top', 0),
                     crop_bottom_percent=crops.get('bottom', 0),
                     crop_left_percent=crops.get('left', 0),
-                    crop_right_percent=crops.get('right', 0)
+                    crop_right_percent=crops.get('right', 0),
+                    stretch_mode=stretch_mode
                 )
 
             # Center the image in the preview area
-            result = Image.new('RGB', PREVIEW_SIZE, '#f0f0f0')
-            x = (PREVIEW_SIZE[0] - pil_image.width) // 2
-            y = (PREVIEW_SIZE[1] - pil_image.height) // 2
+            result = Image.new('RGB', canvas_size, '#f0f0f0')
+            x = (canvas_size[0] - pil_image.width) // 2
+            y = (canvas_size[1] - pil_image.height) // 2
             result.paste(pil_image, (x, y))
 
             # Convert to PhotoImage and display
@@ -653,7 +904,12 @@ class PagePreview(ttk.Frame):
     def clear(self):
         """Clear the preview and show placeholder."""
         self.current_page = None
+        self.current_crops = None
         self.header.configure(text="Hover over a page")
+
+        # Center placeholder based on actual canvas size
+        canvas_size = self._get_canvas_size()
+        self.canvas.coords(self.placeholder_text, canvas_size[0] // 2, canvas_size[1] // 2)
 
         # Show placeholder, hide image
         self.canvas.itemconfigure(self.placeholder_text, state='normal')
@@ -676,14 +932,14 @@ class CropDialog(tk.Toplevel):
                  initial_crops: dict = None, default_crops: dict = None, on_apply=None):
         super().__init__(parent)
         self.title(f"Trim - Page {page_num}")
-        self.geometry("460x650")
+        self.geometry("460x750")
         self.transient(parent)
         self.grab_set()
 
         self.page_num = page_num
         self.pdf_cache = pdf_cache
         self.on_apply = on_apply
-        self.default_crops = default_crops or {'top': 0.0, 'bottom': 0.0, 'left': 0.0, 'right': 0.0}
+        self.default_crops = default_crops or {'top': 0.0, 'bottom': 0.0, 'left': 0.0, 'right': 0.0, 'stretch': 'none'}
 
         # Initialize crop values
         initial = initial_crops or self.default_crops.copy()
@@ -691,6 +947,9 @@ class CropDialog(tk.Toplevel):
         self.crop_bottom = tk.DoubleVar(value=initial.get('bottom', 0.0))
         self.crop_left = tk.DoubleVar(value=initial.get('left', 0.0))
         self.crop_right = tk.DoubleVar(value=initial.get('right', 0.0))
+
+        # Initialize stretch mode
+        self.stretch_mode = tk.StringVar(value=initial.get('stretch', 'none'))
 
         # Set as default checkbox
         self.set_as_default = tk.BooleanVar(value=False)
@@ -726,6 +985,28 @@ class CropDialog(tk.Toplevel):
         self.canvas.bind("<Button-1>", self._on_mouse_down)
         self.canvas.bind("<B1-Motion>", self._on_drag)
         self.canvas.bind("<ButtonRelease-1>", self._on_mouse_up)
+
+        # Stretch options frame
+        stretch_frame = ttk.LabelFrame(self, text="Stretch after crop")
+        stretch_frame.pack(fill='x', padx=10, pady=5)
+
+        stretch_options = [
+            ('none', "None - Keep cropped size"),
+            ('horizontal', "Horizontal - Stretch width only"),
+            ('vertical', "Vertical - Stretch height only"),
+            ('fill', "Fill - Stretch to original (may distort)"),
+            ('fit', "Fit - Scale to fit (preserve ratio)")
+        ]
+
+        for value, text in stretch_options:
+            rb = ttk.Radiobutton(
+                stretch_frame,
+                text=text,
+                variable=self.stretch_mode,
+                value=value,
+                command=self._update_preview
+            )
+            rb.pack(anchor='w', padx=10, pady=1)
 
         # Checkbox for default
         self.default_check = ttk.Checkbutton(
@@ -861,11 +1142,12 @@ class CropDialog(tk.Toplevel):
         self.dragging_edge = None
 
     def _on_reset(self):
-        """Reset all crops to zero."""
+        """Reset all crops and stretch to defaults."""
         self.crop_top.set(0)
         self.crop_bottom.set(0)
         self.crop_left.set(0)
         self.crop_right.set(0)
+        self.stretch_mode.set('none')
         self._update_preview()
 
     def _on_apply_click(self):
@@ -875,7 +1157,8 @@ class CropDialog(tk.Toplevel):
                 'top': self.crop_top.get(),
                 'bottom': self.crop_bottom.get(),
                 'left': self.crop_left.get(),
-                'right': self.crop_right.get()
+                'right': self.crop_right.get(),
+                'stretch': self.stretch_mode.get()
             }
             self.on_apply(crops, self.set_as_default.get())
         self.destroy()
@@ -999,6 +1282,77 @@ class CropDialog(tk.Toplevel):
             edges['right'], self.image_y + self.image_height,
             fill=self.EDGE_COLOR, width=edge_width
         )
+
+        # Show stretch mode indicator if stretch is active
+        stretch = self.stretch_mode.get()
+        if stretch != 'none':
+            # Draw a small preview of the stretched result in the bottom right corner
+            has_crop = any([
+                self.crop_top.get() > 0,
+                self.crop_bottom.get() > 0,
+                self.crop_left.get() > 0,
+                self.crop_right.get() > 0
+            ])
+            if has_crop:
+                self._draw_stretch_preview(stretch)
+
+    def _draw_stretch_preview(self, stretch_mode: str):
+        """Draw a small preview showing the stretched result."""
+        # Calculate cropped region in original image coordinates
+        orig_width, orig_height = self.original_image.size
+        crop_left = int(orig_width * self.crop_left.get() / 100)
+        crop_right = int(orig_width * self.crop_right.get() / 100)
+        crop_top = int(orig_height * self.crop_top.get() / 100)
+        crop_bottom = int(orig_height * self.crop_bottom.get() / 100)
+
+        # Crop the original image
+        cropped = self.original_image.crop((
+            crop_left, crop_top,
+            orig_width - crop_right, orig_height - crop_bottom
+        ))
+        cropped_w, cropped_h = cropped.size
+
+        # Apply stretch
+        if stretch_mode == 'horizontal':
+            new_size = (orig_width, cropped_h)
+        elif stretch_mode == 'vertical':
+            new_size = (cropped_w, orig_height)
+        elif stretch_mode == 'fill':
+            new_size = (orig_width, orig_height)
+        elif stretch_mode == 'fit':
+            scale = min(orig_width / cropped_w, orig_height / cropped_h)
+            new_size = (int(cropped_w * scale), int(cropped_h * scale))
+        else:
+            return
+
+        stretched = cropped.resize(new_size, Image.Resampling.LANCZOS)
+
+        # Create preview thumbnail (max 80x100 pixels)
+        preview_max_w, preview_max_h = 80, 100
+        preview_scale = min(preview_max_w / stretched.width, preview_max_h / stretched.height)
+        preview_size = (int(stretched.width * preview_scale), int(stretched.height * preview_scale))
+        preview = stretched.resize(preview_size, Image.Resampling.LANCZOS)
+
+        # Position in bottom-right corner with padding
+        preview_x = self.CANVAS_WIDTH - preview_size[0] - 10
+        preview_y = self.CANVAS_HEIGHT - preview_size[1] - 10
+
+        # Draw background and border
+        self.canvas.create_rectangle(
+            preview_x - 3, preview_y - 3,
+            preview_x + preview_size[0] + 3, preview_y + preview_size[1] + 3,
+            fill='#1a1a1a', outline='#4CAF50', width=2
+        )
+
+        # Draw label
+        self.canvas.create_text(
+            preview_x + preview_size[0] // 2, preview_y - 12,
+            text="Stretch Preview", fill='#4CAF50', font=('TkDefaultFont', 8)
+        )
+
+        # Draw preview image
+        self.stretch_preview_photo = ImageTk.PhotoImage(preview)
+        self.canvas.create_image(preview_x, preview_y, anchor='nw', image=self.stretch_preview_photo)
 
 
 class BookListPanel(ttk.Frame):
@@ -1132,9 +1486,10 @@ class BookListPanel(ttk.Frame):
 class SelectionBuilder(ttk.Frame):
     """Page selection entry with validation and info display."""
 
-    def __init__(self, parent, on_change=None):
+    def __init__(self, parent, on_change=None, on_smart_blanks=None):
         super().__init__(parent)
         self.on_change = on_change
+        self.on_smart_blanks = on_smart_blanks
         self.total_pages = 0
 
         # Selection entry
@@ -1159,6 +1514,7 @@ class SelectionBuilder(ttk.Frame):
         btn_frame.pack(fill='x', pady=5)
 
         ttk.Button(btn_frame, text="Add Blank", command=self._add_blank).pack(side='left', padx=2)
+        ttk.Button(btn_frame, text="Smart Blanks", command=self._add_smart_blanks).pack(side='left', padx=2)
         ttk.Button(btn_frame, text="Clear", command=self._clear).pack(side='left', padx=2)
 
     def set_total_pages(self, total: int):
@@ -1255,6 +1611,11 @@ class SelectionBuilder(ttk.Frame):
         if self.on_change:
             self.on_change([])
 
+    def _add_smart_blanks(self):
+        """Trigger smart blank insertion."""
+        if self.on_smart_blanks:
+            self.on_smart_blanks()
+
 
 class BookletMakerGUI(tk.Tk):
     """Main application window."""
@@ -1293,12 +1654,14 @@ class BookletMakerGUI(tk.Tk):
         menubar = tk.Menu(self)
 
         file_menu = tk.Menu(menubar, tearoff=0)
+        file_menu.add_command(label="New", command=self._new_workspace, accelerator="Ctrl+N")
         file_menu.add_command(label="Open...", command=self._open_pdf, accelerator="Ctrl+O")
         file_menu.add_separator()
         file_menu.add_command(label="Exit", command=self.quit)
         menubar.add_cascade(label="File", menu=file_menu)
 
         self.config(menu=menubar)
+        self.bind('<Control-n>', lambda e: self._new_workspace())
         self.bind('<Control-o>', lambda e: self._open_pdf())
 
     def _create_ui(self):
@@ -1371,7 +1734,11 @@ class BookletMakerGUI(tk.Tk):
         select_frame = ttk.LabelFrame(books_select_frame, text="Page Selection (editing current book)")
         select_frame.pack(side='left', fill='both', expand=True)
 
-        self.selection_builder = SelectionBuilder(select_frame, on_change=self._on_selection_text_change)
+        self.selection_builder = SelectionBuilder(
+            select_frame,
+            on_change=self._on_selection_text_change,
+            on_smart_blanks=self._on_smart_blanks
+        )
         self.selection_builder.pack(fill='x', padx=5, pady=5)
 
         # Options
@@ -1443,56 +1810,139 @@ class BookletMakerGUI(tk.Tk):
                 pass  # Ignore cleanup errors
             self.temp_pdf_path = None
 
+    def _new_workspace(self):
+        """Clear everything and start fresh with a new workspace."""
+        # Clean up temp files
+        self._cleanup_temp_pdf()
+
+        # Clean up any temp CBZ PDFs
+        if hasattr(self, '_temp_cbz_pdfs'):
+            for temp_path in self._temp_cbz_pdfs:
+                if os.path.exists(temp_path):
+                    try:
+                        os.unlink(temp_path)
+                    except OSError:
+                        pass
+            self._temp_cbz_pdfs = []
+
+        # Reset state
+        self.pdf_path = None
+        self._loaded_files = []
+
+        # Clear thumbnail grid
+        self.thumbnail_grid.clear_all()
+
+        # Clear selection builder
+        self.selection_builder.set_selection_string("")
+        self.selection_builder.set_total_pages(0)
+
+        # Clear page preview
+        self.page_preview.clear()
+
+        # Reset UI elements
+        self.file_label.configure(text="No PDF loaded")
+        self.book_list.set_books([{'selection': ''}])
+        self.book_list.set_current_index(0)
+        self.output_name.delete(0, tk.END)
+        self.progress['value'] = 0
+
     def _open_pdf(self):
-        """Open a PDF or CBZ file."""
+        """Open a PDF or CBZ file. Merges with existing document if one is loaded."""
         path = filedialog.askopenfilename(
             title="Select PDF or CBZ",
             filetypes=[("Comic files", "*.pdf *.cbz"), ("PDF files", "*.pdf"), ("CBZ files", "*.cbz"), ("All files", "*.*")]
         )
         if path:
-            # Clean up any previous temp file
-            self._cleanup_temp_pdf()
-
-            self.pdf_path = path
-            self.file_label.configure(text=f"{Path(path).name}")
-
-            # Set default output name
-            self.output_name.delete(0, tk.END)
-            self.output_name.insert(0, Path(path).stem + "_book1")
-
-            # Convert CBZ to temp PDF for thumbnail display
+            # Convert CBZ to temp PDF if needed
             if Path(path).suffix.lower() == '.cbz':
                 self.file_label.configure(text=f"{Path(path).name} (converting...)")
                 self.update_idletasks()
                 try:
-                    self.temp_pdf_path = cbz_to_pdf(path)
-                    pdf_for_display = self.temp_pdf_path
-                    self.file_label.configure(text=f"{Path(path).name}")
+                    pdf_for_display = cbz_to_pdf(path)
+                    # Track this temp file for later cleanup
+                    if not hasattr(self, '_temp_cbz_pdfs'):
+                        self._temp_cbz_pdfs = []
+                    self._temp_cbz_pdfs.append(pdf_for_display)
                 except Exception as e:
                     messagebox.showerror("Error", f"Failed to convert CBZ:\n{e}")
                     return
             else:
                 pdf_for_display = path
 
-            # Load thumbnails
-            self.progress['value'] = 0
-
-            def on_progress(current, total):
-                self.progress['value'] = (current / total) * 100
+            # Check if we should merge or do fresh load
+            if self.thumbnail_grid.cache is not None:
+                # We have an existing document - MERGE with it
+                self.file_label.configure(text=f"Adding {Path(path).name}...")
                 self.update_idletasks()
 
-            self.thumbnail_grid.load_pdf(pdf_for_display, on_progress)
-            self.selection_builder.set_total_pages(
-                pdfium.PdfDocument(pdf_for_display).__len__()
-            )
+                self.progress['value'] = 0
+                def on_progress(current, total):
+                    if total > 0:
+                        self.progress['value'] = (current / total) * 100
+                        self.update_idletasks()
 
-            # Connect the thumbnail cache to the page preview for hover
-            if self.thumbnail_grid.cache:
-                self.page_preview.set_cache(self.thumbnail_grid.cache)
+                # Merge and get new temp path
+                merged_path = self.thumbnail_grid.merge_pdf(pdf_for_display, on_progress)
 
-            # Set default output folder only if not already set from config
-            if not self.output_folder_var.get():
-                self.output_folder_var.set(str(Path(path).parent / "prints"))
+                # Track merged temp path (clean up old one if different)
+                if merged_path:
+                    if self.temp_pdf_path and self.temp_pdf_path != merged_path:
+                        try:
+                            os.unlink(self.temp_pdf_path)
+                        except OSError:
+                            pass
+                    self.temp_pdf_path = merged_path
+
+                # Update total pages in selection builder
+                self.selection_builder.set_total_pages(self.thumbnail_grid.cache.total_pages)
+
+                # Update preview cache
+                if self.thumbnail_grid.cache:
+                    self.page_preview.set_cache(self.thumbnail_grid.cache)
+
+                # Track loaded files for display
+                if not hasattr(self, '_loaded_files'):
+                    self._loaded_files = [self.pdf_path] if self.pdf_path else []
+                self._loaded_files.append(path)
+                self.file_label.configure(text=f"{len(self._loaded_files)} files loaded")
+
+            else:
+                # No existing document - do normal fresh load
+                self._cleanup_temp_pdf()
+
+                self.pdf_path = path
+                self.file_label.configure(text=f"{Path(path).name}")
+
+                # Set default output name
+                self.output_name.delete(0, tk.END)
+                self.output_name.insert(0, Path(path).stem + "_book1")
+
+                # Track as first loaded file
+                self._loaded_files = [path]
+
+                # Set temp_pdf_path if we converted a CBZ
+                if Path(path).suffix.lower() == '.cbz':
+                    self.temp_pdf_path = pdf_for_display
+
+                # Load thumbnails
+                self.progress['value'] = 0
+
+                def on_progress(current, total):
+                    self.progress['value'] = (current / total) * 100
+                    self.update_idletasks()
+
+                self.thumbnail_grid.load_pdf(pdf_for_display, on_progress)
+                self.selection_builder.set_total_pages(
+                    pdfium.PdfDocument(pdf_for_display).__len__()
+                )
+
+                # Connect the thumbnail cache to the page preview for hover
+                if self.thumbnail_grid.cache:
+                    self.page_preview.set_cache(self.thumbnail_grid.cache)
+
+                # Set default output folder only if not already set from config
+                if not self.output_folder_var.get():
+                    self.output_folder_var.set(str(Path(path).parent / "prints"))
 
     def _split_double_pages(self):
         """Split double-page spreads in the currently loaded file."""
@@ -1502,6 +1952,10 @@ class BookletMakerGUI(tk.Tk):
 
         # Get the PDF to process (use temp PDF if we converted from CBZ)
         pdf_to_split = self.temp_pdf_path if self.temp_pdf_path else self.pdf_path
+
+        # Save current state BEFORE split (load_pdf will clear it)
+        saved_spread_pairs = self.thumbnail_grid.spread_pairs.copy()
+        saved_page_crops = self.thumbnail_grid.page_crops.copy()
 
         self.file_label.configure(text=f"{Path(self.pdf_path).name} (splitting...)")
         self.update_idletasks()
@@ -1545,12 +1999,22 @@ class BookletMakerGUI(tk.Tk):
             self.thumbnail_grid.clear_selection()
             self.selection_builder.set_selection_string("")
 
-            # Auto-mark split pairs as spreads
+            # Restore saved state - spread_pairs and page_crops
+            # Note: Page numbers may have shifted due to splits, but we preserve what we can
+            self.thumbnail_grid.spread_pairs = saved_spread_pairs.copy()
+            self.thumbnail_grid.page_crops = saved_page_crops.copy()
+
+            # Add the auto-detected split pairs (merge with existing)
             if result.get('split_pairs'):
-                self.thumbnail_grid.spread_pairs = result['split_pairs'].copy()
-                # Highlighting is applied during thumbnail creation in _add_thumbnail()
-                # Just trigger alignment validation
-                self._on_spread_change(result['split_pairs'])
+                for pair in result['split_pairs']:
+                    if pair not in self.thumbnail_grid.spread_pairs:
+                        self.thumbnail_grid.spread_pairs.append(pair)
+
+            # Force refresh to apply all highlighting (spread, crop, selection)
+            self.thumbnail_grid._update_selection_display()
+
+            # Trigger alignment validation with all spread pairs
+            self._on_spread_change(self.thumbnail_grid.spread_pairs)
 
             self.file_label.configure(text=f"{Path(self.pdf_path).name}")
             messagebox.showinfo(
@@ -1606,6 +2070,46 @@ class BookletMakerGUI(tk.Tk):
         self._save_current_book()
         self._update_preview()
         self._check_spread_alignment()
+
+    def _on_smart_blanks(self):
+        """Handle smart blanks button click."""
+        from src.services.smart_blanks_service import SmartBlanksService
+
+        pages = self.selection_builder.get_pages()
+        if not pages:
+            messagebox.showinfo("Smart Blanks", "No pages selected.")
+            return
+
+        cover_tags = self.thumbnail_grid.get_cover_tags()
+        spread_pairs = [(sp[0], sp[1]) for sp in self.thumbnail_grid.spread_pairs]
+
+        modified, changes = SmartBlanksService.calculate_smart_blanks(
+            pages,
+            cover_tags.get('front'),
+            cover_tags.get('back'),
+            spread_pairs
+        )
+
+        if not changes:
+            messagebox.showinfo("Smart Blanks", "Layout is already optimal!")
+            return
+
+        # Show confirmation dialog
+        msg = "Smart Blanks will make these changes:\n\n" + "\n".join(f"- {c}" for c in changes)
+        if messagebox.askyesno("Confirm Smart Blanks", msg):
+            # Convert back to selection string and apply
+            self._apply_smart_blanks_result(modified)
+
+    def _apply_smart_blanks_result(self, pages: List):
+        """Apply the smart blanks result to selection."""
+        # Convert page list back to selection string format
+        parts = []
+        for p in pages:
+            if p == "blank":
+                parts.append("b")
+            else:
+                parts.append(str(p))
+        self.selection_builder.set_selection_string(",".join(parts))
 
     def _check_spread_alignment(self):
         """Check and display spread alignment warnings."""

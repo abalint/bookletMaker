@@ -22,6 +22,15 @@ class DuplexMode(Enum):
     MANUAL = "manual"  # Separate files for front and back pages
 
 
+class StretchMode(Enum):
+    """Stretch mode for cropped images."""
+    NONE = "none"              # No stretching - keep cropped size
+    HORIZONTAL = "horizontal"  # Stretch width only to original width
+    VERTICAL = "vertical"      # Stretch height only to original height
+    FILL = "fill"              # Stretch both to original size (may distort)
+    FIT = "fit"                # Scale uniformly to fit (preserve ratio)
+
+
 @dataclass
 class BookDefinition:
     """
@@ -143,12 +152,14 @@ class PageCropData:
 
     Supports cropping from all four sides. Each value represents the
     percentage of the page dimension to remove from that edge.
+    Optionally supports stretching the cropped result back to original size.
     """
     page_num: int                    # Page number to crop (1-indexed)
     crop_top_percent: float = 0.0    # Percentage to crop from top (0-30%)
     crop_bottom_percent: float = 0.0 # Percentage to crop from bottom (0-30%)
     crop_left_percent: float = 0.0   # Percentage to crop from left (0-30%)
     crop_right_percent: float = 0.0  # Percentage to crop from right (0-30%)
+    stretch_mode: StretchMode = StretchMode.NONE  # How to stretch after crop
 
     def __post_init__(self):
         """Validate crop settings."""
@@ -166,6 +177,10 @@ class PageCropData:
         if self.crop_left_percent + self.crop_right_percent > 60:
             raise ValueError("Combined horizontal crop cannot exceed 60%")
 
+        # Convert string to StretchMode if needed
+        if isinstance(self.stretch_mode, str):
+            self.stretch_mode = StretchMode(self.stretch_mode)
+
     def has_crop(self) -> bool:
         """Check if any cropping is applied."""
         return any([
@@ -181,18 +196,26 @@ class PageCropData:
             'top': self.crop_top_percent,
             'bottom': self.crop_bottom_percent,
             'left': self.crop_left_percent,
-            'right': self.crop_right_percent
+            'right': self.crop_right_percent,
+            'stretch': self.stretch_mode.value
         }
 
     @classmethod
     def from_dict(cls, page_num: int, data: dict) -> 'PageCropData':
         """Create from dictionary."""
+        stretch_str = data.get('stretch', 'none')
+        try:
+            stretch_mode = StretchMode(stretch_str)
+        except ValueError:
+            stretch_mode = StretchMode.NONE
+
         return cls(
             page_num=page_num,
             crop_top_percent=data.get('top', 0.0),
             crop_bottom_percent=data.get('bottom', 0.0),
             crop_left_percent=data.get('left', 0.0),
-            crop_right_percent=data.get('right', 0.0)
+            crop_right_percent=data.get('right', 0.0),
+            stretch_mode=stretch_mode
         )
 
 
@@ -203,6 +226,7 @@ class CropDefaults:
     bottom: float = 0.0
     left: float = 0.0
     right: float = 0.0
+    stretch: StretchMode = StretchMode.NONE
 
     def __post_init__(self):
         """Validate default values."""
@@ -211,17 +235,32 @@ class CropDefaults:
             if not 0 <= value <= 30:
                 raise ValueError(f"{field_name} must be between 0 and 30, got {value}")
 
+        # Convert string to StretchMode if needed
+        if isinstance(self.stretch, str):
+            try:
+                self.stretch = StretchMode(self.stretch)
+            except ValueError:
+                self.stretch = StretchMode.NONE
+
     def to_dict(self) -> dict:
         """Convert to dictionary for storage."""
         return {'top': self.top, 'bottom': self.bottom,
-                'left': self.left, 'right': self.right}
+                'left': self.left, 'right': self.right,
+                'stretch': self.stretch.value}
 
     @classmethod
     def from_dict(cls, data: dict) -> 'CropDefaults':
         """Create from dictionary."""
+        stretch_str = data.get('stretch', 'none')
+        try:
+            stretch_mode = StretchMode(stretch_str)
+        except ValueError:
+            stretch_mode = StretchMode.NONE
+
         return cls(
             top=data.get('top', 0.0),
             bottom=data.get('bottom', 0.0),
             left=data.get('left', 0.0),
-            right=data.get('right', 0.0)
+            right=data.get('right', 0.0),
+            stretch=stretch_mode
         )
