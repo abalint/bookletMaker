@@ -1,0 +1,6 @@
+config.json
+src/__pycache__/config.cpython-310.pyc
+src/__pycache__/models.cpython-310.pyc
+src/__pycache__/validators.cpython-310.pyc
+src/services/__pycache__/crop_service.cpython-310.pyc
+/__pycache__
