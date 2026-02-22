@@ -6,8 +6,9 @@
   "output_folder": "I:/comics/marvel/Captain America (2005)/prints",
   "default_crop": {
     "top": 0.0,
-    "bottom": 3.485838779956427,
+    "bottom": 6.753812636165578,
     "left": 0.0,
-    "right": 0.0
+    "right": 0.0,
+    "stretch": "fit"
   }
 }
