@@ -116,6 +116,61 @@ def cbz_to_pdf(cbz_path: str) -> str:
     return temp_pdf_path
 
 
+def images_to_pdf(image_paths: List[str]) -> str:
+    """
+    Convert multiple image files to a temporary PDF.
+
+    Args:
+        image_paths: List of paths to image files
+
+    Returns:
+        Path to the temporary PDF file
+
+    Raises:
+        ValueError: If no valid images found
+    """
+    if not image_paths:
+        raise ValueError("No image paths provided")
+
+    # Create temporary PDF file
+    temp_pdf = tempfile.NamedTemporaryFile(suffix='.pdf', delete=False)
+    temp_pdf_path = temp_pdf.name
+    temp_pdf.close()
+
+    # Load and convert images
+    pdf_images = []
+    for img_path in image_paths:
+        try:
+            img = Image.open(img_path)
+            # Convert to RGB if necessary (for PNG with transparency, etc.)
+            if img.mode in ('RGBA', 'P', 'LA'):
+                # Create white background for transparent images
+                background = Image.new('RGB', img.size, (255, 255, 255))
+                if img.mode == 'P':
+                    img = img.convert('RGBA')
+                background.paste(img, mask=img.split()[-1] if img.mode in ('RGBA', 'LA') else None)
+                img = background
+            elif img.mode != 'RGB':
+                img = img.convert('RGB')
+            pdf_images.append(img.copy())
+        except Exception as e:
+            print(f"Warning: Failed to load image {img_path}: {e}")
+
+    if not pdf_images:
+        raise ValueError("No valid images found")
+
+    # Save all images as a PDF
+    pdf_images[0].save(
+        temp_pdf_path,
+        'PDF',
+        save_all=True,
+        append_images=pdf_images[1:] if len(pdf_images) > 1 else []
+    )
+
+    print(f"Converted {len(pdf_images)} image(s) to temporary PDF")
+    return temp_pdf_path
+
+
 def split_double_pages(input_path: str, output_path: str = None) -> dict:
     """
     Split double-page spreads in a PDF into separate pages.
@@ -445,6 +500,84 @@ def compose_sheet(left_page: PageObject, right_page: PageObject, paper_size: str
     return sheet
 
 
+def _generate_flat_pdf(
+    input_pdf: PdfReader,
+    pages: List[Union[int, str]],
+    paper_size: str,
+    output_dir: Path,
+    base_name: str
+) -> List[str]:
+    """
+    Generate a flat PDF with selected pages at original size.
+
+    Each page is placed on a sheet of the specified paper size.
+    Pages are output in sequential order (no booklet reordering).
+
+    Args:
+        input_pdf: Source PDF reader
+        pages: List of page numbers or "blank"
+        paper_size: Paper size key (e.g., 'tabloid', 'a3')
+        output_dir: Output directory
+        base_name: Base filename
+
+    Returns:
+        List containing the output file path
+    """
+    from pypdf import PdfWriter, PageObject, Transformation
+
+    # Get paper dimensions
+    sheet_width, sheet_height = PAPER_SIZES.get(
+        paper_size,
+        PAPER_SIZES[DEFAULT_PAPER_SIZE]
+    )
+
+    # Create PDF writer
+    writer = PdfWriter()
+
+    # Process each page
+    for page_ref in pages:
+        if page_ref == "blank":
+            # Create blank page at paper size
+            sheet = PageObject.create_blank_page(
+                width=sheet_width,
+                height=sheet_height
+            )
+        else:
+            # Get source page (1-indexed to 0-indexed)
+            source_page = input_pdf.pages[page_ref - 1]
+
+            # Create blank sheet at paper size
+            sheet = PageObject.create_blank_page(
+                width=sheet_width,
+                height=sheet_height
+            )
+
+            # Get source page dimensions
+            page_width = source_page.mediabox.width
+            page_height = source_page.mediabox.height
+
+            # Calculate centering transformation
+            # Place page at center of sheet, maintaining original size
+            x_offset = (sheet_width - page_width) / 2
+            y_offset = (sheet_height - page_height) / 2
+
+            # Create transformation to center the page
+            transform = Transformation().translate(x_offset, y_offset)
+
+            # Merge source page onto sheet
+            sheet.merge_transformed_page(source_page, transform)
+
+        # Add sheet to output
+        writer.add_page(sheet)
+
+    # Write output PDF
+    output_path = output_dir / f"{base_name}_flat.pdf"
+    with open(output_path, "wb") as f:
+        writer.write(f)
+
+    return [str(output_path)]
+
+
 def generate_single_booklet(
     reader: PdfReader,
     page_selection: str,
@@ -479,6 +612,19 @@ def generate_single_booklet(
     pages = parse_page_selection(page_selection, total_pages)
     print(f"  Pages: {len(pages)} (including blanks)")
 
+    # FLAT PDF MODE (num_signatures = 0)
+    if num_signatures == 0:
+        print(f"  Generating flat PDF (no booklet layout)")
+        base_name = f"{output_name}{book_suffix}"
+        return _generate_flat_pdf(
+            input_pdf=reader,
+            pages=pages,
+            paper_size=paper_size,
+            output_dir=output_dir,
+            base_name=base_name
+        )
+
+    # BOOKLET MODE (num_signatures >= 1)
     # Calculate booklet order
     signatures = calculate_booklet_order(pages, num_signatures, reading_order)
 
